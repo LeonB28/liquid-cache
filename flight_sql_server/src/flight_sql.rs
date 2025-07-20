@@ -15,19 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use arrow::datatypes::{Schema, ToByteSlice};
 use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::flight_descriptor::DescriptorType;
 use arrow_flight::flight_service_server::{FlightService, FlightServiceServer};
 use arrow_flight::sql::metadata::{SqlInfoData, SqlInfoDataBuilder};
 use arrow_flight::sql::server::FlightSqlService;
-use arrow_flight::sql::{
-    Any, CommandGetCatalogs, CommandGetSqlInfo, CommandGetTables, CommandPreparedStatementQuery,
-    CommandPreparedStatementUpdate, CommandStatementQuery, ProstMessageExt, SqlInfo,
-};
-use arrow_flight::{
-    Action, FlightDescriptor, FlightEndpoint, FlightInfo, IpcMessage, SchemaAsIpc, Ticket,
-};
+use arrow_flight::sql::{Any, CommandGetSqlInfo, CommandStatementQuery, ProstMessageExt, SqlInfo};
+use arrow_flight::{Action, FlightDescriptor, FlightEndpoint, FlightInfo, Ticket};
 use clap::Parser;
 use datafusion::prelude::{ParquetReadOptions, SessionConfig, SessionContext};
 use datafusion::{error::Result, execution::object_store::ObjectStoreUrl};
