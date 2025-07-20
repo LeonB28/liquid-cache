@@ -22,13 +22,11 @@ use arrow_flight::flight_service_server::{FlightService, FlightServiceServer};
 use arrow_flight::sql::metadata::{SqlInfoData, SqlInfoDataBuilder};
 use arrow_flight::sql::server::FlightSqlService;
 use arrow_flight::sql::{
-    ActionCreatePreparedStatementResult, Any, CommandGetCatalogs, CommandGetSqlInfo,
-    CommandGetTables, CommandPreparedStatementQuery, CommandPreparedStatementUpdate,
-    CommandStatementQuery, ProstMessageExt, SqlInfo,
+    Any, CommandGetCatalogs, CommandGetSqlInfo, CommandGetTables, CommandPreparedStatementQuery,
+    CommandPreparedStatementUpdate, CommandStatementQuery, ProstMessageExt, SqlInfo,
 };
 use arrow_flight::{
-    Action, FlightDescriptor, FlightEndpoint, FlightInfo, HandshakeRequest, HandshakeResponse,
-    IpcMessage, SchemaAsIpc, Ticket,
+    Action, FlightDescriptor, FlightEndpoint, FlightInfo, IpcMessage, SchemaAsIpc, Ticket,
 };
 use clap::Parser;
 use datafusion::prelude::{ParquetReadOptions, SessionConfig, SessionContext};
