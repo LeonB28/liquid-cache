@@ -107,7 +107,7 @@ pub struct FlightSqlServiceImpl {
 impl FlightSqlServiceImpl {
     fn new(cache_server: impl AsRef<str>) -> Self {
         let file = "file:///Users/leon.bam/data-sets/hits.parquet";
-        let url = Url::parse(&file).unwrap();
+        let url = Url::parse(file).unwrap();
         let object_store_url = format!("{}://{}", url.scheme(), url.host_str().unwrap_or_default());
         let ctx = LiquidCacheBuilder::new(cache_server)
             .with_object_store(
@@ -123,7 +123,7 @@ impl FlightSqlServiceImpl {
 
     async fn with_file(&self) -> datafusion::common::Result<()> {
         let file = "file:///Users/leon.bam/data-sets/hits.parquet";
-        let url = Url::parse(&file).unwrap();
+        let url = Url::parse(file).unwrap();
         let table_name = Path::new(url.path())
             .file_stem()
             .unwrap_or_default()
