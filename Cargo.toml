@@ -17,6 +17,7 @@ members = [
 	"src/common",
 	"examples",
 	"fuzz",
+	"flight_sql_server"
 ]
 resolver = "3"
 
