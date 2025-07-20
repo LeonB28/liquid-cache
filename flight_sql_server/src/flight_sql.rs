@@ -23,10 +23,9 @@ use arrow_flight::flight_service_server::{FlightService, FlightServiceServer};
 use arrow_flight::sql::metadata::{SqlInfoData, SqlInfoDataBuilder};
 use arrow_flight::sql::server::FlightSqlService;
 use arrow_flight::sql::{
-    ActionCreatePreparedStatementRequest,
-    ActionCreatePreparedStatementResult, Any, CommandGetCatalogs, CommandGetSqlInfo,
-    CommandGetTables, CommandPreparedStatementQuery, CommandPreparedStatementUpdate,
-    CommandStatementQuery, ProstMessageExt, SqlInfo,
+    ActionCreatePreparedStatementRequest, ActionCreatePreparedStatementResult, Any,
+    CommandGetCatalogs, CommandGetSqlInfo, CommandGetTables, CommandPreparedStatementQuery,
+    CommandPreparedStatementUpdate, CommandStatementQuery, ProstMessageExt, SqlInfo,
 };
 use arrow_flight::{
     Action, FlightData, FlightDescriptor, FlightEndpoint, FlightInfo, HandshakeRequest,
@@ -37,7 +36,7 @@ use dashmap::DashMap;
 use datafusion::logical_expr::{LogicalPlan, UserDefinedLogicalNode};
 use datafusion::prelude::{DataFrame, ParquetReadOptions, SessionConfig, SessionContext};
 use datafusion::{error::Result, execution::object_store::ObjectStoreUrl, prelude::*};
-use futures::{stream, Stream, StreamExt, TryStreamExt};
+use futures::{Stream, StreamExt, TryStreamExt, stream};
 use liquid_cache_client::LiquidCacheBuilder;
 use liquid_cache_common::CacheMode;
 use log::info;
@@ -130,7 +129,8 @@ impl FlightSqlServiceImpl {
             .unwrap_or_default()
             .to_str()
             .unwrap_or("default");
-        self.ctx.register_parquet(table_name, url.as_ref(), Default::default())
+        self.ctx
+            .register_parquet(table_name, url.as_ref(), Default::default())
             .await
     }
 }
@@ -272,7 +272,7 @@ pub struct Close {}
 impl Stream for Close {
     type Item = Result<arrow_flight::Result, Status>;
 
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+    fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         Poll::Ready(Some(Ok(arrow_flight::Result::new("fdfd"))))
     }
 }
