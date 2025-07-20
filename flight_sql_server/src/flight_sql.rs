@@ -31,9 +31,8 @@ use arrow_flight::{
     IpcMessage, SchemaAsIpc, Ticket,
 };
 use clap::Parser;
-use dashmap::DashMap;
 use datafusion::prelude::{ParquetReadOptions, SessionConfig, SessionContext};
-use datafusion::{error::Result, execution::object_store::ObjectStoreUrl, prelude::*};
+use datafusion::{error::Result, execution::object_store::ObjectStoreUrl};
 use futures::{Stream, StreamExt, TryStreamExt};
 use liquid_cache_client::LiquidCacheBuilder;
 use liquid_cache_common::CacheMode;
