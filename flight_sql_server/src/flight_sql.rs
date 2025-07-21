@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use arrow::datatypes::Schema;
 use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::flight_descriptor::DescriptorType;
 use arrow_flight::flight_service_server::{FlightService, FlightServiceServer};
@@ -23,7 +24,9 @@ use arrow_flight::sql::server::FlightSqlService;
 use arrow_flight::sql::{Any, CommandGetSqlInfo, CommandStatementQuery, ProstMessageExt, SqlInfo};
 use arrow_flight::{Action, FlightDescriptor, FlightEndpoint, FlightInfo, Ticket};
 use clap::Parser;
+use datafusion::error::DataFusionError;
 use datafusion::prelude::{ParquetReadOptions, SessionConfig, SessionContext};
+use datafusion::sql::parser::{DFParser, Statement};
 use datafusion::{error::Result, execution::object_store::ObjectStoreUrl};
 use futures::{Stream, StreamExt, TryStreamExt};
 use liquid_cache_client::LiquidCacheBuilder;
@@ -33,7 +36,6 @@ use once_cell::sync::Lazy;
 use prost::Message;
 use serde::Serialize;
 use std::net::SocketAddr;
-use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -49,13 +51,17 @@ macro_rules! status {
 
 #[derive(Parser, Serialize, Clone)]
 pub struct FlightServerArgs {
-    /// Server Flight Server on
+    /// Flight Server URL
     #[arg(long, default_value = "127.0.0.1:50052")]
     pub flight_server: SocketAddr,
 
-    /// LiquidCache server URL
+    /// LiquidCache Server URL
     #[arg(long, default_value = "http://localhost:15214")]
     pub cache_server: String,
+
+    /// Object Store path
+    #[arg(long)]
+    pub object_store_url: String,
 }
 
 /// FlightSqlService with Liquid cache so support adbc flight sql
@@ -78,8 +84,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = FlightServerArgs::parse();
     let serve_on = args.flight_server;
     let liquid_cache_server = &args.cache_server;
-
-    let service = FlightSqlServiceImpl::new(liquid_cache_server);
+    let object_store_url = args.object_store_url;
+    let service = FlightSqlServiceImpl::new(liquid_cache_server, object_store_url);
     info!("Listening on {serve_on:?}, liquid cache server on {liquid_cache_server:?}");
 
     let svc = FlightServiceServer::new(service);
@@ -92,33 +98,56 @@ pub struct FlightSqlServiceImpl {
 }
 
 impl FlightSqlServiceImpl {
-    fn new(cache_server: impl AsRef<str>) -> Self {
-        let file = "file:///Users/leon.bam/data-sets/hits.parquet";
-        let url = Url::parse(file).unwrap();
-        let object_store_url = format!("{}://{}", url.scheme(), url.host_str().unwrap_or_default());
+    fn new(cache_server: impl AsRef<str>, object_store_url: String) -> Self {
+        let url = Url::parse(&object_store_url).unwrap();
+        let object_store = format!("{}://{}", url.scheme(), url.host_str().unwrap_or_default());
         let ctx = LiquidCacheBuilder::new(cache_server)
-            .with_object_store(
-                ObjectStoreUrl::parse(object_store_url.as_str()).unwrap(),
-                None,
-            )
+            .with_object_store(ObjectStoreUrl::parse(object_store.as_str()).unwrap(), None)
             .with_cache_mode(CacheMode::Liquid)
             .build(SessionConfig::from_env().unwrap())
             .unwrap();
-
         Self { ctx: Arc::new(ctx) }
     }
 
-    async fn with_file(&self) -> datafusion::common::Result<()> {
-        let file = "file:///Users/leon.bam/data-sets/hits.parquet";
-        let url = Url::parse(file).unwrap();
-        let table_name = Path::new(url.path())
-            .file_stem()
-            .unwrap_or_default()
-            .to_str()
-            .unwrap_or("default");
+    async fn with_table(&self, file: Url, table_name: &str) -> Result<()> {
         self.ctx
-            .register_parquet(table_name, url.as_ref(), ParquetReadOptions::default())
+            .register_parquet(table_name, file.as_ref(), ParquetReadOptions::default())
             .await
+            .or_else(|e| {
+                match e {
+                    // allow table already exists
+                    DataFusionError::SchemaError(_, _) => Ok(()),
+                    _ => Err(e),
+                }
+            })
+    }
+
+    async fn get_flight_info_create_table_statement(
+        &self,
+        table: datafusion::sql::parser::CreateExternalTable,
+    ) -> Result<Response<FlightInfo>, Status> {
+        let create_table = CreateExternalTable {
+            name: table.name.to_string(),
+            location: table.location,
+            format: table.file_type,
+        };
+        let buf = create_table.as_any().encode_to_vec().into();
+        let ticket = Ticket { ticket: buf };
+        let endpoint = FlightEndpoint {
+            ticket: Some(ticket),
+            location: vec![],
+            expiration_time: None,
+            app_metadata: vec![].into(),
+        };
+        let info = FlightInfo::new()
+            .with_endpoint(endpoint)
+            .with_descriptor(FlightDescriptor {
+                r#type: DescriptorType::Cmd.into(),
+                cmd: Default::default(),
+                path: vec![],
+            });
+
+        Ok(Response::new(info))
     }
 }
 
@@ -131,41 +160,54 @@ impl FlightSqlService for FlightSqlServiceImpl {
         _request: Request<Ticket>,
         message: Any,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
-        if !message.is::<FetchResults>() {
+        if message.is::<FetchResults>() {
+            let fr: FetchResults = message
+                .unpack()
+                .map_err(|e| Status::internal(format!("{e:?}")))?
+                .ok_or_else(|| Status::internal("Expected FetchResults but got None!"))?;
+
+            let query = fr.handle;
+            info!("getting results for {query}");
+
+            let df = self
+                .ctx
+                .sql(&query)
+                .await
+                .map_err(|e| status!("Unable to query statement", e))?;
+            let schema = df.schema().inner().clone();
+            let batches = df
+                .collect()
+                .await
+                .map_err(|e| status!("Unable to collect batch", e))?;
+
+            let batch_stream = futures::stream::iter(batches).map(Ok);
+
+            let stream = FlightDataEncoderBuilder::new()
+                .with_schema(schema)
+                .build(batch_stream)
+                .map_err(Status::from);
+
+            Ok(Response::new(Box::pin(stream)))
+        } else if message.is::<CreateExternalTable>() {
+            let cet: CreateExternalTable = message
+                .unpack()
+                .map_err(|e| Status::internal(format!("{e:?}")))?
+                .ok_or_else(|| Status::internal("Expected FetchResults but got None!"))?;
+            let location_url = Url::parse(&cet.location).unwrap();
+            self.with_table(location_url, &cet.name).await.unwrap();
+            let (schema, batches) = (Arc::new(Schema::empty()), vec![]);
+            let batch_stream = futures::stream::iter(batches).map(Ok);
+            let stream = FlightDataEncoderBuilder::new()
+                .with_schema(schema)
+                .build(batch_stream)
+                .map_err(Status::from);
+            Ok(Response::new(Box::pin(stream)))
+        } else {
             Err(Status::unimplemented(format!(
                 "do_get: The defined request is invalid: {}",
                 message.type_url
             )))?
         }
-
-        let fr: FetchResults = message
-            .unpack()
-            .map_err(|e| Status::internal(format!("{e:?}")))?
-            .ok_or_else(|| Status::internal("Expected FetchResults but got None!"))?;
-
-        let query = fr.handle;
-
-        info!("getting results for {query}");
-
-        let x = self
-            .ctx
-            .sql(&query)
-            .await
-            .map_err(|e| status!("Unable to query statement", e))?;
-        let ss = x.schema().inner().clone();
-        let batches = x
-            .collect()
-            .await
-            .map_err(|e| status!("Unable to collect batch", e))?;
-
-        let batch_stream = futures::stream::iter(batches).map(Ok);
-
-        let stream = FlightDataEncoderBuilder::new()
-            .with_schema(ss)
-            .build(batch_stream)
-            .map_err(Status::from);
-
-        Ok(Response::new(Box::pin(stream)))
     }
 
     async fn get_flight_info_statement(
@@ -173,43 +215,49 @@ impl FlightSqlService for FlightSqlServiceImpl {
         query: CommandStatementQuery,
         _request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        let user_query = query.query.as_str();
-
         let ctx = self.ctx.clone();
-        let plan = ctx
-            .sql(user_query)
-            .await
-            .and_then(|df| df.into_optimized_plan())
-            .map_err(|e| Status::internal(format!("Error building plan: {e}")))?;
+        let user_query = query.query.as_str();
+        let statements = DFParser::parse_sql(user_query).unwrap();
+        let statement = statements.get(0).unwrap().clone();
 
-        // self.statements.insert("plan".into(), plan.clone());
-        //
-        // let plan_schema = plan.schema();
+        match statement {
+            Statement::CreateExternalTable(table) => {
+                self.get_flight_info_create_table_statement(table.clone())
+                    .await
+            }
+            _ => {
+                let fetch = FetchResults {
+                    handle: user_query.to_string(),
+                };
+                let buf = fetch.as_any().encode_to_vec().into();
+                let plan = ctx
+                    .sql(user_query)
+                    .await
+                    .and_then(|df| df.into_optimized_plan())
+                    .map_err(|e| Status::internal(format!("Error building plan: {e}")))?;
 
-        let arrow_schema = plan.schema().as_arrow();
+                let arrow_schema = plan.schema().as_arrow();
 
-        let fetch = FetchResults {
-            handle: query.query,
-        };
-        let buf = fetch.as_any().encode_to_vec().into();
-        let ticket = Ticket { ticket: buf };
-        let endpoint = FlightEndpoint {
-            ticket: Some(ticket),
-            location: vec![],
-            expiration_time: None,
-            app_metadata: vec![].into(),
-        };
+                let ticket = Ticket { ticket: buf };
+                let endpoint = FlightEndpoint {
+                    ticket: Some(ticket),
+                    location: vec![],
+                    expiration_time: None,
+                    app_metadata: vec![].into(),
+                };
 
-        let info = FlightInfo::new()
-            .try_with_schema(arrow_schema)
-            .map_err(|e| status!("Unable to encode statement", e))?
-            .with_endpoint(endpoint)
-            .with_descriptor(FlightDescriptor {
-                r#type: DescriptorType::Cmd.into(),
-                cmd: Default::default(),
-                path: vec![],
-            });
-        Ok(Response::new(info))
+                let info = FlightInfo::new()
+                    .try_with_schema(arrow_schema)
+                    .map_err(|e| status!("Unable to encode statement", e))?
+                    .with_endpoint(endpoint)
+                    .with_descriptor(FlightDescriptor {
+                        r#type: DescriptorType::Cmd.into(),
+                        cmd: Default::default(),
+                        path: vec![],
+                    });
+                Ok(Response::new(info))
+            }
+        }
     }
     async fn get_flight_info_sql_info(
         &self,
@@ -225,8 +273,6 @@ impl FlightSqlService for FlightSqlServiceImpl {
             .map_err(|e| status!("Unable to encode schema", e))?
             .with_endpoint(endpoint)
             .with_descriptor(flight_descriptor);
-
-        self.with_file().await.unwrap();
         Ok(Response::new(flight_info))
     }
 
@@ -270,6 +316,18 @@ pub struct FetchResults {
     pub handle: ::prost::alloc::string::String,
 }
 
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CreateExternalTable {
+    #[prost(string, tag = "1")]
+    pub location: ::prost::alloc::string::String,
+
+    #[prost(string, tag = "2")]
+    pub name: ::prost::alloc::string::String,
+
+    #[prost(string, tag = "3")]
+    pub format: ::prost::alloc::string::String,
+}
+
 impl ProstMessageExt for FetchResults {
     fn type_url() -> &'static str {
         "type.googleapis.com/liquid_cache.com.sql.FetchResults"
@@ -279,6 +337,19 @@ impl ProstMessageExt for FetchResults {
         Any {
             type_url: FetchResults::type_url().to_string(),
             value: ::prost::Message::encode_to_vec(self).into(),
+        }
+    }
+}
+
+impl ProstMessageExt for CreateExternalTable {
+    fn type_url() -> &'static str {
+        "type.googleapis.com/liquid_cache.com.sql.CreateExternalTable"
+    }
+
+    fn as_any(&self) -> Any {
+        Any {
+            type_url: CreateExternalTable::type_url().to_string(),
+            value: Message::encode_to_vec(self).into(),
         }
     }
 }
