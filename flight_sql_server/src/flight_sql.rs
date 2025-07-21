@@ -116,8 +116,11 @@ impl FlightSqlServiceImpl {
             .or_else(|e| {
                 match e {
                     // allow table already exists
-                    DataFusionError::Execution(message) 
-                        if message == "The table hits already exists" => Ok(()),
+                    DataFusionError::Execution(message)
+                        if message == "The table hits already exists" =>
+                    {
+                        Ok(())
+                    }
                     _ => Err(e),
                 }
             })
