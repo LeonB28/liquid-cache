@@ -218,7 +218,7 @@ impl FlightSqlService for FlightSqlServiceImpl {
         let ctx = self.ctx.clone();
         let user_query = query.query.as_str();
         let statements = DFParser::parse_sql(user_query).unwrap();
-        let statement = statements.get(0).unwrap().clone();
+        let statement = statements.front().unwrap().clone();
 
         match statement {
             Statement::CreateExternalTable(table) => {
