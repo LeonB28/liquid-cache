@@ -128,6 +128,7 @@ impl FlightSqlServiceImpl {
         }
     }
 
+    #[allow(clippy::result_large_err)]
     fn get_plan(&self, handle: &str) -> Result<Option<LogicalPlan>, Status> {
         if let Some(plan) = self.plans.get(handle) {
             Ok(plan.clone())
@@ -136,6 +137,7 @@ impl FlightSqlServiceImpl {
         }
     }
 
+    #[allow(clippy::result_large_err)]
     fn get_result(&self, handle: &str) -> Result<Option<Vec<RecordBatch>>, Status> {
         if let Some(result) = self.results.get(handle) {
             Ok(result.clone())
@@ -337,7 +339,7 @@ impl FlightSqlService for FlightSqlServiceImpl {
         let handle = std::str::from_utf8(&query.prepared_statement_handle)
             .map_err(|e| status!("Unable to parse uuid", e))?;
 
-        let plan = self.get_plan(&handle)?;
+        let plan = self.get_plan(handle)?;
         let plan_schema = match plan {
             Some(logical_plan) => {
                 let state = self.ctx.state();
