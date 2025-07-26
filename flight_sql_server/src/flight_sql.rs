@@ -16,15 +16,26 @@
 // under the License.
 
 use arrow::datatypes::Schema;
+use arrow::ipc::writer::IpcWriteOptions;
+use arrow::record_batch::RecordBatch;
 use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::flight_descriptor::DescriptorType;
 use arrow_flight::flight_service_server::{FlightService, FlightServiceServer};
 use arrow_flight::sql::metadata::{SqlInfoData, SqlInfoDataBuilder};
 use arrow_flight::sql::server::FlightSqlService;
-use arrow_flight::sql::{Any, CommandGetSqlInfo, CommandStatementQuery, ProstMessageExt, SqlInfo};
-use arrow_flight::{Action, FlightDescriptor, FlightEndpoint, FlightInfo, Ticket};
+use arrow_flight::sql::{
+    ActionClosePreparedStatementRequest, ActionCreatePreparedStatementRequest,
+    ActionCreatePreparedStatementResult, Any, CommandGetSqlInfo, CommandPreparedStatementQuery,
+    ProstMessageExt, SqlInfo,
+};
+use arrow_flight::{
+    Action, FlightDescriptor, FlightEndpoint, FlightInfo, IpcMessage, SchemaAsIpc, Ticket,
+};
 use clap::Parser;
+use dashmap::DashMap;
+use datafusion::dataframe::DataFrame;
 use datafusion::error::DataFusionError;
+use datafusion::logical_expr::LogicalPlan;
 use datafusion::prelude::{ParquetReadOptions, SessionConfig, SessionContext};
 use datafusion::sql::parser::{DFParser, Statement};
 use datafusion::{error::Result, execution::object_store::ObjectStoreUrl};
@@ -40,8 +51,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use tonic::transport::Server;
-use tonic::{Request, Response, Status};
+use tonic::{Code, Request, Response, Status};
 use url::Url;
+use uuid::Uuid;
 
 macro_rules! status {
     ($desc:expr, $err:expr) => {
@@ -95,6 +107,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 pub struct FlightSqlServiceImpl {
     ctx: Arc<SessionContext>,
+    plans: Arc<DashMap<String, Option<LogicalPlan>>>,
+    results: Arc<DashMap<String, Option<Vec<RecordBatch>>>>,
 }
 
 impl FlightSqlServiceImpl {
@@ -106,7 +120,42 @@ impl FlightSqlServiceImpl {
             .with_cache_mode(CacheMode::Liquid)
             .build(SessionConfig::from_env().unwrap())
             .unwrap();
-        Self { ctx: Arc::new(ctx) }
+
+        Self {
+            ctx: Arc::new(ctx),
+            plans: Default::default(),
+            results: Default::default(),
+        }
+    }
+
+    fn get_plan(&self, handle: &str) -> Result<Option<LogicalPlan>, Status> {
+        if let Some(plan) = self.plans.get(handle) {
+            Ok(plan.clone())
+        } else {
+            Err(Status::internal(format!("Plan handle not found: {handle}")))?
+        }
+    }
+
+    fn get_result(&self, handle: &str) -> Result<Option<Vec<RecordBatch>>, Status> {
+        if let Some(result) = self.results.get(handle) {
+            Ok(result.clone())
+        } else {
+            Err(Status::internal(format!(
+                "Request handle not found: {handle}"
+            )))?
+        }
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn remove_plan(&self, handle: &str) -> Result<(), Status> {
+        self.plans.remove(&handle.to_string());
+        Ok(())
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn remove_result(&self, handle: &str) -> Result<(), Status> {
+        self.results.remove(&handle.to_string());
+        Ok(())
     }
 
     async fn with_table(&self, file: Url, table_name: &str) -> Result<()> {
@@ -124,32 +173,8 @@ impl FlightSqlServiceImpl {
             })
     }
 
-    async fn get_flight_info_create_table_statement(
-        &self,
-        table: datafusion::sql::parser::CreateExternalTable,
-    ) -> Result<Response<FlightInfo>, Status> {
-        let create_table = CreateExternalTable {
-            name: table.name.to_string(),
-            location: table.location,
-            format: table.file_type,
-        };
-        let buf = create_table.as_any().encode_to_vec().into();
-        let ticket = Ticket { ticket: buf };
-        let endpoint = FlightEndpoint {
-            ticket: Some(ticket),
-            location: vec![],
-            expiration_time: None,
-            app_metadata: vec![].into(),
-        };
-        let info = FlightInfo::new()
-            .with_endpoint(endpoint)
-            .with_descriptor(FlightDescriptor {
-                r#type: DescriptorType::Cmd.into(),
-                cmd: Default::default(),
-                path: vec![],
-            });
-
-        Ok(Response::new(info))
+    fn empty_response(&self) -> (Arc<Schema>, Vec<RecordBatch>) {
+        (Arc::new(Schema::empty()), vec![])
     }
 }
 
@@ -157,110 +182,8 @@ impl FlightSqlServiceImpl {
 impl FlightSqlService for FlightSqlServiceImpl {
     type FlightService = FlightSqlServiceImpl;
 
-    async fn do_get_fallback(
-        &self,
-        _request: Request<Ticket>,
-        message: Any,
-    ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
-        if message.is::<FetchResults>() {
-            let fr: FetchResults = message
-                .unpack()
-                .map_err(|e| Status::internal(format!("{e:?}")))?
-                .ok_or_else(|| Status::internal("Expected FetchResults but got None!"))?;
-
-            let query = fr.handle;
-            info!("getting results for {query}");
-
-            let df = self
-                .ctx
-                .sql(&query)
-                .await
-                .map_err(|e| status!("Unable to query statement", e))?;
-            let schema = df.schema().inner().clone();
-            let batches = df
-                .collect()
-                .await
-                .map_err(|e| status!("Unable to collect batch", e))?;
-
-            let batch_stream = futures::stream::iter(batches).map(Ok);
-
-            let stream = FlightDataEncoderBuilder::new()
-                .with_schema(schema)
-                .build(batch_stream)
-                .map_err(Status::from);
-
-            Ok(Response::new(Box::pin(stream)))
-        } else if message.is::<CreateExternalTable>() {
-            let cet: CreateExternalTable = message
-                .unpack()
-                .map_err(|e| Status::internal(format!("{e:?}")))?
-                .ok_or_else(|| Status::internal("Expected FetchResults but got None!"))?;
-            let location_url = Url::parse(&cet.location).unwrap();
-            self.with_table(location_url, &cet.name).await.unwrap();
-            let (schema, batches) = (Arc::new(Schema::empty()), vec![]);
-            let batch_stream = futures::stream::iter(batches).map(Ok);
-            let stream = FlightDataEncoderBuilder::new()
-                .with_schema(schema)
-                .build(batch_stream)
-                .map_err(Status::from);
-            Ok(Response::new(Box::pin(stream)))
-        } else {
-            Err(Status::unimplemented(format!(
-                "do_get: The defined request is invalid: {}",
-                message.type_url
-            )))?
-        }
-    }
-
-    async fn get_flight_info_statement(
-        &self,
-        query: CommandStatementQuery,
-        _request: Request<FlightDescriptor>,
-    ) -> Result<Response<FlightInfo>, Status> {
-        let ctx = self.ctx.clone();
-        let user_query = query.query.as_str();
-        let statements = DFParser::parse_sql(user_query).unwrap();
-        let statement = statements.front().unwrap().clone();
-
-        match statement {
-            Statement::CreateExternalTable(table) => {
-                self.get_flight_info_create_table_statement(table.clone())
-                    .await
-            }
-            _ => {
-                let fetch = FetchResults {
-                    handle: user_query.to_string(),
-                };
-                let buf = fetch.as_any().encode_to_vec().into();
-                let plan = ctx
-                    .sql(user_query)
-                    .await
-                    .and_then(|df| df.into_optimized_plan())
-                    .map_err(|e| Status::internal(format!("Error building plan: {e}")))?;
-
-                let arrow_schema = plan.schema().as_arrow();
-
-                let ticket = Ticket { ticket: buf };
-                let endpoint = FlightEndpoint {
-                    ticket: Some(ticket),
-                    location: vec![],
-                    expiration_time: None,
-                    app_metadata: vec![].into(),
-                };
-
-                let info = FlightInfo::new()
-                    .try_with_schema(arrow_schema)
-                    .map_err(|e| status!("Unable to encode statement", e))?
-                    .with_endpoint(endpoint)
-                    .with_descriptor(FlightDescriptor {
-                        r#type: DescriptorType::Cmd.into(),
-                        cmd: Default::default(),
-                        path: vec![],
-                    });
-                Ok(Response::new(info))
-            }
-        }
-    }
+    // this is a first call from the driver.
+    // to get flight info about the server
     async fn get_flight_info_sql_info(
         &self,
         query: CommandGetSqlInfo,
@@ -278,6 +201,7 @@ impl FlightSqlService for FlightSqlServiceImpl {
         Ok(Response::new(flight_info))
     }
 
+    // do get data about the server
     async fn do_get_sql_info(
         &self,
         query: CommandGetSqlInfo,
@@ -293,41 +217,189 @@ impl FlightSqlService for FlightSqlServiceImpl {
         Ok(Response::new(Box::pin(stream)))
     }
 
-    async fn do_action_fallback(
+    async fn do_get_fallback(
         &self,
+        _request: Request<Ticket>,
+        message: Any,
+    ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
+        if message.is::<FetchResults>() {
+            let fr: FetchResults = message
+                .unpack()
+                .map_err(|e| Status::internal(format!("{e:?}")))?
+                .ok_or_else(|| Status::internal("Expected FetchResults but got None!"))?;
+
+            let handle = fr.handle;
+            info!("getting results for {handle}");
+            let result = self.get_result(&handle)?;
+
+            // if we get an empty result, create an empty schema
+            let (schema, batches) = match result {
+                None => self.empty_response(),
+                Some(batches) => match batches.first() {
+                    None => self.empty_response(),
+                    Some(batch) => (batch.schema(), batches),
+                },
+            };
+
+            let batch_stream = futures::stream::iter(batches).map(Ok);
+
+            let stream = FlightDataEncoderBuilder::new()
+                .with_schema(schema)
+                .build(batch_stream)
+                .map_err(Status::from);
+
+            Ok(Response::new(Box::pin(stream)))
+        } else {
+            Err(Status::unimplemented(format!(
+                "do_get: The defined request is invalid: {}",
+                message.type_url
+            )))?
+        }
+    }
+
+    // 3
+    async fn do_action_create_prepared_statement(
+        &self,
+        query: ActionCreatePreparedStatementRequest,
         _request: Request<Action>,
-    ) -> Result<Response<<Self as FlightService>::DoActionStream>, Status> {
-        let stream = Close {};
-        Ok(Response::new(Box::pin(stream)))
+    ) -> std::result::Result<ActionCreatePreparedStatementResult, Status> {
+        let user_query = query.query.as_str();
+        info!("do_action_create_prepared_statement: {user_query}");
+
+        let plan_uuid = Uuid::new_v4().hyphenated().to_string();
+
+        let statements = DFParser::parse_sql(user_query)
+            .map_err(|e| Status::internal(format!("Failed to parse query: {e}")))?;
+
+        let statement = statements
+            .front()
+            .ok_or(Status::internal("query is empty"))?;
+
+        match statement {
+            Statement::CreateExternalTable(table) => {
+                let location_url =
+                    Url::parse(&table.location).map_err(|e| status!("Unable parse location", e))?;
+
+                self.with_table(location_url, &table.name.to_string())
+                    .await
+                    .map_err(|e| status!("Unable to register a table", e))?;
+
+                self.plans.insert(plan_uuid.clone(), None);
+
+                let plan_schema = self.empty_response().0;
+                let message = SchemaAsIpc::new(&plan_schema, &IpcWriteOptions::default())
+                    .try_into()
+                    .map_err(|e| status!("Unable to serialize schema", e))?;
+                let IpcMessage(schema_bytes) = message;
+
+                let res = ActionCreatePreparedStatementResult {
+                    prepared_statement_handle: plan_uuid.into(),
+                    dataset_schema: schema_bytes,
+                    parameter_schema: Default::default(),
+                };
+                Ok(res)
+            }
+            _ => {
+                let plan = self
+                    .ctx
+                    .sql(user_query)
+                    .await
+                    .and_then(|df| df.into_optimized_plan())
+                    .map_err(|e| Status::internal(format!("Error building plan: {e}")))?;
+
+                // store a copy of the plan, it will be used for execution
+
+                self.plans.insert(plan_uuid.clone(), Some(plan.clone()));
+                let plan_schema = plan.schema();
+                let arrow_schema = (&**plan_schema).into();
+                let message = SchemaAsIpc::new(&arrow_schema, &IpcWriteOptions::default())
+                    .try_into()
+                    .map_err(|e| status!("Unable to serialize schema", e))?;
+                let IpcMessage(schema_bytes) = message;
+
+                let res = ActionCreatePreparedStatementResult {
+                    prepared_statement_handle: plan_uuid.into(),
+                    dataset_schema: schema_bytes,
+                    parameter_schema: Default::default(),
+                };
+                Ok(res)
+            }
+        }
     }
+
+    // 4
+    async fn get_flight_info_prepared_statement(
+        &self,
+        query: CommandPreparedStatementQuery,
+        _request: Request<FlightDescriptor>,
+    ) -> std::result::Result<Response<FlightInfo>, Status> {
+        info!("get_flight_info_prepared_statement");
+        let handle = std::str::from_utf8(&query.prepared_statement_handle)
+            .map_err(|e| status!("Unable to parse uuid", e))?;
+
+        let plan = self.get_plan(&handle)?;
+        let plan_schema = match plan {
+            Some(logical_plan) => {
+                let state = self.ctx.state();
+                let df = DataFrame::new(state, logical_plan);
+                let result = df
+                    .collect()
+                    .await
+                    .map_err(|e| status!("Error executing query", e))?;
+
+                // if we get an empty result, create an empty schema
+                let schema = match result.first() {
+                    None => Schema::empty(),
+                    Some(batch) => (*batch.schema()).clone(),
+                };
+                self.results.insert(handle.to_string(), Some(result));
+                schema
+            }
+            None => {
+                self.results.insert(handle.to_string(), None);
+                Schema::empty()
+            }
+        };
+        let fetch = FetchResults {
+            handle: handle.to_string(),
+        };
+        let buf = fetch.as_any().encode_to_vec().into();
+        let ticket = Ticket { ticket: buf };
+        let info = FlightInfo::new()
+            // Encode the Arrow schema
+            .try_with_schema(&plan_schema)
+            .expect("encoding failed")
+            .with_endpoint(FlightEndpoint::new().with_ticket(ticket))
+            .with_descriptor(FlightDescriptor {
+                r#type: DescriptorType::Cmd.into(),
+                cmd: Default::default(),
+                path: vec![],
+            });
+        let resp = Response::new(info);
+        Ok(resp)
+    }
+
+    async fn do_action_close_prepared_statement(
+        &self,
+        handle: ActionClosePreparedStatementRequest,
+        _request: Request<Action>,
+    ) -> Result<(), Status> {
+        let handle = std::str::from_utf8(&handle.prepared_statement_handle);
+        if let Ok(handle) = handle {
+            info!("do_action_close_prepared_statement: removing plan and results for {handle}");
+            let _ = self.remove_plan(handle);
+            let _ = self.remove_result(handle);
+        }
+        Ok(())
+    }
+
     async fn register_sql_info(&self, _id: i32, _result: &SqlInfo) {}
-}
-
-pub struct Close {}
-impl Stream for Close {
-    type Item = Result<arrow_flight::Result, Status>;
-
-    fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Poll::Ready(Some(Ok(arrow_flight::Result::new("fdfd"))))
-    }
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct FetchResults {
     #[prost(string, tag = "1")]
     pub handle: ::prost::alloc::string::String,
-}
-
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct CreateExternalTable {
-    #[prost(string, tag = "1")]
-    pub location: ::prost::alloc::string::String,
-
-    #[prost(string, tag = "2")]
-    pub name: ::prost::alloc::string::String,
-
-    #[prost(string, tag = "3")]
-    pub format: ::prost::alloc::string::String,
 }
 
 impl ProstMessageExt for FetchResults {
@@ -339,19 +411,6 @@ impl ProstMessageExt for FetchResults {
         Any {
             type_url: FetchResults::type_url().to_string(),
             value: ::prost::Message::encode_to_vec(self).into(),
-        }
-    }
-}
-
-impl ProstMessageExt for CreateExternalTable {
-    fn type_url() -> &'static str {
-        "type.googleapis.com/liquid_cache.com.sql.CreateExternalTable"
-    }
-
-    fn as_any(&self) -> Any {
-        Any {
-            type_url: CreateExternalTable::type_url().to_string(),
-            value: Message::encode_to_vec(self).into(),
         }
     }
 }
