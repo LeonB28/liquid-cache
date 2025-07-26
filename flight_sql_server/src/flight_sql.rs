@@ -47,11 +47,10 @@ use once_cell::sync::Lazy;
 use prost::Message;
 use serde::Serialize;
 use std::net::SocketAddr;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use tonic::transport::Server;
-use tonic::{Code, Request, Response, Status};
+use tonic::{Request, Response, Status};
 use url::Url;
 use uuid::Uuid;
 
