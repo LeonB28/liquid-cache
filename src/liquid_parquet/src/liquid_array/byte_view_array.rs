@@ -1,18 +1,21 @@
+use arrow::array::BinaryViewArray;
 use arrow::array::{
-    Array, ArrayAccessor, ArrayIter, ArrayRef, BinaryArray, BooleanArray, DictionaryArray,
-    GenericByteArray, StringArray, StringViewArray, UInt16Array, cast::AsArray, types::UInt16Type,
+    Array, ArrayAccessor, ArrayIter, ArrayRef, BinaryArray, BooleanArray, BooleanBuilder,
+    DictionaryArray, GenericByteArray, StringArray, StringViewArray, UInt16Array, UInt32Array,
+    cast::AsArray, types::UInt16Type,
 };
-use arrow::array::{BinaryViewArray, BooleanBufferBuilder};
-use arrow::buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
-use arrow::compute::{cast, kernels};
-use arrow::datatypes::{BinaryType, ByteArrayType, Utf8Type};
+use arrow::buffer::{BooleanBuffer, NullBuffer};
+use arrow::compute::{cast, kernels, sort_to_indices};
+use arrow::datatypes::ByteArrayType;
 use arrow_schema::ArrowError;
+use bytes;
 use datafusion::logical_expr::{ColumnarValue, Operator};
 use datafusion::physical_expr_common::datum::apply_cmp;
 use datafusion::physical_plan::PhysicalExpr;
 use datafusion::physical_plan::expressions::{BinaryExpr, LikeExpr, Literal};
-use fsst::{Compressor, Decompressor};
+use fsst::Compressor;
 use std::any::Any;
+use std::fmt::Display;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
@@ -22,6 +25,7 @@ use std::cell::Cell;
 #[cfg(test)]
 thread_local! {
     static DISK_READ_COUNTER: Cell<usize> = const { Cell::new(0)};
+    static FULL_DATA_COMPARISON_COUNTER: Cell<usize> = const { Cell::new(0)};
 }
 
 #[cfg(test)]
@@ -45,34 +49,32 @@ use super::{
     LiquidArray, LiquidArrayRef, LiquidDataType,
     byte_array::{ArrowByteType, get_string_needle},
 };
-use crate::liquid_array::raw::FsstArray;
+use crate::liquid_array::raw::fsst_array::{RawFsstBuffer, train_compressor};
 use crate::utils::CheckedDictionaryArray;
 use std::fs::File;
 use std::io::{self, Write};
 
-/// A dictionary view structure that stores dictionary key and a 6-byte prefix
-/// Layout: [key: u16][prefix: 6 bytes]
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
-pub struct DictionaryView {
-    key: u16,
-    prefix: [u8; 6],
+pub struct OffsetView {
+    offset: u32,
+    prefix: [u8; 8],
 }
 
-const _: () = if std::mem::size_of::<DictionaryView>() != 8 {
-    panic!("DictionaryView must be 8 bytes")
+const _: () = if std::mem::size_of::<OffsetView>() != 12 {
+    panic!("OffsetView must be 12 bytes")
 };
 
-impl DictionaryView {
-    pub fn new(key: u16, prefix: [u8; 6]) -> Self {
-        Self { key, prefix }
+impl OffsetView {
+    pub fn new(offset: u32, prefix: [u8; 8]) -> Self {
+        Self { offset, prefix }
     }
 
-    pub fn key(&self) -> u16 {
-        self.key
+    pub fn offset(&self) -> u32 {
+        self.offset
     }
 
-    pub fn prefix(&self) -> &[u8; 6] {
+    pub fn prefix(&self) -> &[u8; 8] {
         &self.prefix
     }
 }
@@ -80,64 +82,44 @@ impl DictionaryView {
 /// Storage options for FSST buffer - can be in memory or on disk
 #[derive(Clone)]
 pub enum FsstBufferStorage {
-    InMemory(Arc<FsstArray>),
-    OnDisk(PathBuf, Arc<Compressor>),
+    InMemory(Arc<RawFsstBuffer>),
+    OnDisk(PathBuf),
 }
 
 impl std::fmt::Debug for FsstBufferStorage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            FsstBufferStorage::InMemory(fsst_array) => {
-                f.debug_tuple("InMemory").field(fsst_array).finish()
+            FsstBufferStorage::InMemory(raw_buffer) => {
+                f.debug_tuple("InMemory").field(raw_buffer).finish()
             }
-            FsstBufferStorage::OnDisk(path, _) => f
-                .debug_tuple("OnDisk")
-                .field(path)
-                .field(&"<Compressor>")
-                .finish(),
+            FsstBufferStorage::OnDisk(path) => f.debug_tuple("OnDisk").field(path).finish(),
         }
     }
 }
 
 impl FsstBufferStorage {
-    /// Get the FSST array, loading from disk if necessary
-    pub fn get_fsst_array(&self) -> Result<Arc<FsstArray>, io::Error> {
+    /// Get the raw FSST buffer, loading from disk if necessary
+    pub fn get_raw_buffer(&self) -> Result<Arc<RawFsstBuffer>, io::Error> {
         match self {
-            FsstBufferStorage::InMemory(array) => Ok(array.clone()),
-            FsstBufferStorage::OnDisk(path, compressor) => {
+            FsstBufferStorage::InMemory(buffer) => Ok(buffer.clone()),
+            FsstBufferStorage::OnDisk(path) => {
                 // Increment disk read counter for testing
                 #[cfg(test)]
                 increment_disk_read_counter();
 
                 let bytes = std::fs::read(path)?;
                 let bytes = bytes::Bytes::from(bytes);
-                let fsst_array = FsstArray::from_bytes(bytes, compressor.clone());
-                Ok(Arc::new(fsst_array))
+                let raw_buffer = RawFsstBuffer::from_bytes(bytes);
+                Ok(Arc::new(raw_buffer))
             }
-        }
-    }
-
-    /// Get the compressor without loading the full FSST array
-    pub fn get_compressor(&self) -> &Compressor {
-        match self {
-            FsstBufferStorage::InMemory(array) => array.compressor(),
-            FsstBufferStorage::OnDisk(_, compressor) => compressor,
-        }
-    }
-
-    /// Get the decompressor without loading the full FSST array
-    pub fn get_decompressor(&self) -> Decompressor<'_> {
-        match self {
-            FsstBufferStorage::InMemory(array) => array.decompressor(),
-            FsstBufferStorage::OnDisk(_, compressor) => compressor.decompressor(),
         }
     }
 
     /// Get memory size - returns 0 for on-disk storage
     pub fn get_array_memory_size(&self) -> usize {
         match self {
-            FsstBufferStorage::InMemory(array) => array.get_array_memory_size(),
-            FsstBufferStorage::OnDisk(_, _) => 0,
+            FsstBufferStorage::InMemory(buffer) => buffer.get_memory_size(),
+            FsstBufferStorage::OnDisk(_) => 0,
         }
     }
 
@@ -148,7 +130,7 @@ impl FsstBufferStorage {
 
     /// Check if the buffer is stored on disk
     pub fn is_on_disk(&self) -> bool {
-        matches!(self, FsstBufferStorage::OnDisk(_, _))
+        matches!(self, FsstBufferStorage::OnDisk(_))
     }
 }
 
@@ -158,16 +140,11 @@ impl LiquidArray for LiquidByteViewArray {
     }
 
     fn get_array_memory_size(&self) -> usize {
-        self.dictionary_views.len() * std::mem::size_of::<DictionaryView>()
-            + self.offsets.inner().len() * std::mem::size_of::<i32>()
-            + self.nulls.as_ref().map_or(0, |n| n.buffer().len())
-            + self.fsst_buffer.read().unwrap().get_array_memory_size()
-            + self.shared_prefix.len()
-            + std::mem::size_of::<Self>()
+        self.get_detailed_memory_usage().total()
     }
 
     fn len(&self) -> usize {
-        self.dictionary_views.len()
+        self.dictionary_keys.len()
     }
 
     #[inline]
@@ -205,54 +182,20 @@ impl LiquidArray for LiquidByteViewArray {
 }
 
 fn filter_inner(array: &LiquidByteViewArray, filter: &BooleanArray) -> LiquidByteViewArray {
-    // Only filter the dictionary views, not the offsets!
-    // Offsets reference unique values in FSST buffer and should remain unchanged
-    let filtered_views: Vec<DictionaryView> = array
-        .dictionary_views
-        .iter()
-        .zip(filter.iter())
-        .filter_map(|(view, select)| {
-            if select.unwrap_or(false) {
-                Some(*view)
-            } else {
-                None
-            }
-        })
-        .collect();
+    // Only filter the dictionary keys, not the offset views!
+    // Offset views reference unique values in FSST buffer and should remain unchanged
 
-    // Filter nulls to match the filtered views
-    let filtered_nulls = if let Some(nulls) = &array.nulls {
-        let indices: Vec<usize> = filter
-            .iter()
-            .enumerate()
-            .filter_map(|(i, select)| {
-                if select.unwrap_or(false) {
-                    Some(i)
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        let filtered_len = indices.len();
-        let mut filtered_nulls = Vec::with_capacity(filtered_len);
-        for idx in indices {
-            filtered_nulls.push(nulls.is_null(idx));
-        }
-
-        let buffer = BooleanBuffer::from(filtered_nulls);
-        Some(NullBuffer::from(buffer))
-    } else {
-        None
-    };
+    // Filter the dictionary keys using Arrow's built-in filter functionality
+    let filtered_keys = arrow::compute::filter(&array.dictionary_keys, filter).unwrap();
+    let filtered_keys = filtered_keys.as_primitive::<UInt16Type>().clone();
 
     LiquidByteViewArray {
-        dictionary_views: filtered_views,
-        offsets: array.offsets.clone(), // Keep original offsets - they reference unique values
-        nulls: filtered_nulls,
+        dictionary_keys: filtered_keys,
+        offset_views: array.offset_views.clone(), // Keep original offset views - they reference unique values
         fsst_buffer: array.fsst_buffer.clone(),
         original_arrow_type: array.original_arrow_type,
         shared_prefix: array.shared_prefix.clone(),
+        compressor: array.compressor.clone(),
     }
 }
 
@@ -325,41 +268,40 @@ fn try_eval_predicate_inner(
 }
 
 /// An array that stores strings using the FSST view format:
-/// - Dictionary views with 2-byte keys and 6-byte prefixes stored in memory
-/// - Offsets for unique values in FSST buffer stored in memory
-/// - Nulls stored in memory
+/// - Dictionary keys with 2-byte keys stored in memory
+/// - Offset views with 4-byte offsets and 8-byte prefixes stored in memory
 /// - FSST buffer can be stored in memory or on disk
 ///
 /// Data access flow:
-/// 1. Use dictionary view key to index into offsets buffer to get start/end positions
-/// 2. Use those offsets to read the corresponding bytes from FSST buffer
-/// 3. Decompress those bytes to get the full value
-/// 4. Use prefix for quick comparisons to avoid decompression when possible
+/// 1. Use dictionary key to index into offset_views buffer
+/// 2. Use offset from offset_views to read the corresponding bytes from FSST buffer
+/// 3. Use prefix from offset_views for quick comparisons to avoid decompression when possible
+/// 4. Decompress bytes from FSST buffer to get the full value when needed
 #[derive(Clone)]
 pub struct LiquidByteViewArray {
-    /// Dictionary views containing key (u16) and prefix (6 bytes)
-    dictionary_views: Vec<DictionaryView>,
-    /// Offsets into the FSST buffer - one offset per unique value (same length as fsst_buffer)
-    offsets: OffsetBuffer<i32>,
-    /// Null buffer
-    nulls: Option<NullBuffer>,
+    /// Dictionary keys (u16) - one per array element, using Arrow's UInt16Array for zero-copy
+    dictionary_keys: UInt16Array,
+    /// Offset views containing offset (u32) and prefix (8 bytes) - one per unique value
+    offset_views: Vec<OffsetView>,
     /// FSST-compressed buffer (can be in memory or on disk)
     fsst_buffer: Arc<RwLock<FsstBufferStorage>>,
     /// Used to convert back to the original arrow type
     original_arrow_type: ArrowByteType,
     /// Shared prefix across all strings in the array
     shared_prefix: Vec<u8>,
+    /// Compressor for decompression
+    compressor: Arc<Compressor>,
 }
 
 impl std::fmt::Debug for LiquidByteViewArray {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LiquidByteViewArray")
-            .field("dictionary_views", &self.dictionary_views)
-            .field("offsets", &self.offsets)
-            .field("nulls", &self.nulls)
+            .field("dictionary_keys", &self.dictionary_keys)
+            .field("offset_views", &self.offset_views)
             .field("fsst_buffer", &self.fsst_buffer)
             .field("original_arrow_type", &self.original_arrow_type)
             .field("shared_prefix", &self.shared_prefix)
+            .field("compressor", &"<Compressor>")
             .finish()
     }
 }
@@ -407,16 +349,18 @@ impl LiquidByteViewArray {
     pub fn train_compressor<'a, T: ArrayAccessor<Item = &'a str>>(
         array: ArrayIter<T>,
     ) -> Arc<Compressor> {
-        let strings = array.filter_map(|s| s.as_ref().map(|s| s.as_bytes()));
-        Arc::new(FsstArray::train_compressor(strings))
+        Arc::new(train_compressor(
+            array.filter_map(|s| s.as_ref().map(|s| s.as_bytes())),
+        ))
     }
 
     /// Train a compressor from an iterator of byte arrays
     pub fn train_compressor_bytes<'a, T: ArrayAccessor<Item = &'a [u8]>>(
         array: ArrayIter<T>,
     ) -> Arc<Compressor> {
-        let strings = array.filter_map(|s| s.as_ref().map(|s| *s));
-        Arc::new(FsstArray::train_compressor(strings))
+        Arc::new(train_compressor(
+            array.filter_map(|s| s.as_ref().map(|s| *s)),
+        ))
     }
 
     /// Generic implementation for view arrays (StringViewArray and BinaryViewArray)
@@ -500,108 +444,89 @@ impl LiquidByteViewArray {
 
         let shared_prefix_len = shared_prefix.len();
 
-        // Create dictionary views with prefixes - one per original array element
-        let mut dictionary_views = Vec::with_capacity(keys.len());
+        // Create offset views with prefixes - one per unique value in dictionary
+        let mut offset_views = Vec::with_capacity(values.len());
 
-        // Create offsets for unique values - one per unique value in FSST buffer
-        let mut offsets = Vec::with_capacity(values.len() + 1);
-        let mut current_offset = 0i32;
-        offsets.push(current_offset);
+        let mut compress_buffer = Vec::with_capacity(1024 * 1024 * 2);
 
-        // Calculate offsets for each unique value in the dictionary
-        for i in 0..values.len() {
-            let value_len = if let Some(string_values) = values.as_string_opt::<i32>() {
-                string_values.value(i).len()
+        // Create the raw buffer and get the byte offsets
+        let (raw_fsst_buffer, byte_offsets) =
+            if let Some(string_values) = values.as_string_opt::<i32>() {
+                RawFsstBuffer::from_byte_slices(
+                    string_values.iter().map(|s| s.map(|s| s.as_bytes())),
+                    compressor.clone(),
+                    &mut compress_buffer,
+                )
             } else if let Some(binary_values) = values.as_binary_opt::<i32>() {
-                binary_values.value(i).len()
+                RawFsstBuffer::from_byte_slices(
+                    binary_values.iter(),
+                    compressor.clone(),
+                    &mut compress_buffer,
+                )
             } else {
                 panic!("Unsupported dictionary value type")
             };
-            current_offset += value_len as i32;
-            offsets.push(current_offset);
-        }
 
-        // Create dictionary views with prefixes for each key
-        for key_opt in keys.iter() {
-            if let Some(key) = key_opt {
-                let key_idx = key as usize;
-
-                // Get value bytes for this key
-                let value_bytes = if let Some(string_values) = values.as_string_opt::<i32>() {
-                    string_values.value(key_idx).as_bytes()
-                } else if let Some(binary_values) = values.as_binary_opt::<i32>() {
-                    binary_values.value(key_idx)
-                } else {
-                    panic!("Unsupported dictionary value type")
-                };
-
-                // Extract 6-byte prefix after removing shared prefix
-                let remaining_bytes = if shared_prefix_len < value_bytes.len() {
-                    &value_bytes[shared_prefix_len..]
-                } else {
-                    &[]
-                };
-
-                let mut prefix = [0u8; 6];
-                let prefix_len = std::cmp::min(remaining_bytes.len(), 6);
-                prefix[..prefix_len].copy_from_slice(&remaining_bytes[..prefix_len]);
-
-                dictionary_views.push(DictionaryView::new(key, prefix));
+        for (i, byte_offset) in byte_offsets.iter().enumerate().take(values.len()) {
+            let value_bytes = if let Some(string_values) = values.as_string_opt::<i32>() {
+                string_values.value(i).as_bytes()
+            } else if let Some(binary_values) = values.as_binary_opt::<i32>() {
+                binary_values.value(i)
             } else {
-                // For null values, use a default view
-                dictionary_views.push(DictionaryView::new(0, [0u8; 6]));
-            }
+                panic!("Unsupported dictionary value type")
+            };
+
+            // Extract 8-byte prefix after removing shared prefix
+            let remaining_bytes = if shared_prefix_len < value_bytes.len() {
+                &value_bytes[shared_prefix_len..]
+            } else {
+                &[]
+            };
+
+            let mut prefix = [0u8; 8];
+            let prefix_len = std::cmp::min(remaining_bytes.len(), 8);
+            prefix[..prefix_len].copy_from_slice(&remaining_bytes[..prefix_len]);
+
+            offset_views.push(OffsetView::new(*byte_offset, prefix));
         }
 
-        let offsets = OffsetBuffer::new(ScalarBuffer::from(offsets));
-
-        // Create FSST buffer from unique values (full strings, not after removing shared prefix)
-        let fsst_buffer = if let Some(string_values) = values.as_string_opt::<i32>() {
-            FsstArray::from_byte_array_with_compressor(string_values, compressor.clone())
-        } else if let Some(binary_values) = values.as_binary_opt::<i32>() {
-            FsstArray::from_byte_array_with_compressor(binary_values, compressor.clone())
-        } else {
-            panic!("Unsupported dictionary value type")
-        };
+        assert_eq!(values.len(), byte_offsets.len() - 1);
+        offset_views.push(OffsetView::new(byte_offsets[values.len()], [0u8; 8]));
 
         Self {
-            dictionary_views,
-            offsets,
-            nulls: keys.nulls().cloned(),
+            dictionary_keys: keys,
+            offset_views,
             fsst_buffer: Arc::new(RwLock::new(FsstBufferStorage::InMemory(Arc::new(
-                fsst_buffer,
+                raw_fsst_buffer,
             )))),
             original_arrow_type: arrow_type,
             shared_prefix,
+            compressor,
         }
     }
 
     /// Convert to Arrow DictionaryArray
     pub fn to_dict_arrow(&self) -> DictionaryArray<UInt16Type> {
-        // Create keys array from dictionary views
-        let keys = self
-            .dictionary_views
-            .iter()
-            .map(|view| view.key())
-            .collect::<Vec<_>>();
-        let keys_array = if let Some(nulls) = &self.nulls {
-            UInt16Array::new(keys.into(), Some(nulls.clone()))
-        } else {
-            UInt16Array::from(keys)
-        };
+        let keys_array = self.dictionary_keys.clone();
 
-        // Convert FSST buffer to values (full strings are already stored)
+        // Convert raw FSST buffer to values using our offset views
         let storage = self.fsst_buffer.read().unwrap();
-        let fsst_array = storage.get_fsst_array().unwrap();
+        let raw_buffer = storage.get_raw_buffer().unwrap();
 
-        // Get full values directly from FSST buffer (no need to prepend shared prefix)
+        let (values_buffer, offsets_buffer) =
+            raw_buffer.to_uncompressed(&self.compressor.decompressor(), &self.offset_views);
+
         let values = if self.original_arrow_type == ArrowByteType::Utf8
             || self.original_arrow_type == ArrowByteType::Utf8View
             || self.original_arrow_type == ArrowByteType::Dict16Utf8
         {
-            Arc::new(fsst_array.to_arrow_byte_array::<Utf8Type>()) as ArrayRef
+            let string_array =
+                unsafe { StringArray::new_unchecked(offsets_buffer, values_buffer, None) };
+            Arc::new(string_array) as ArrayRef
         } else {
-            Arc::new(fsst_array.to_arrow_byte_array::<BinaryType>()) as ArrayRef
+            let binary_array =
+                unsafe { BinaryArray::new_unchecked(offsets_buffer, values_buffer, None) };
+            Arc::new(binary_array) as ArrayRef
         };
 
         unsafe { DictionaryArray::<UInt16Type>::new_unchecked(keys_array, values) }
@@ -615,35 +540,116 @@ impl LiquidByteViewArray {
 
     /// Get the nulls buffer
     pub fn nulls(&self) -> Option<&NullBuffer> {
-        self.nulls.as_ref()
+        self.dictionary_keys.nulls()
     }
 
     /// Compare equality with a byte needle
     fn compare_equals(&self, needle: &[u8]) -> BooleanArray {
+        // Fast path 1: Check shared prefix
+        let shared_prefix_len = self.shared_prefix.len();
+        if needle.len() < shared_prefix_len || needle[..shared_prefix_len] != self.shared_prefix {
+            return BooleanArray::new(
+                BooleanBuffer::new_unset(self.dictionary_keys.len()),
+                self.nulls().cloned(),
+            );
+        }
+
         let storage = self.fsst_buffer.read().unwrap();
-        let compressor = storage.get_compressor();
-
-        // Compress the full needle (not after removing shared prefix)
-        let compressed = compressor.compress(needle);
-
-        // We need the full FSST array to search through the compressed values
-        let fsst_array = storage.get_fsst_array().unwrap();
-        let values = &fsst_array.compressed;
-        let idx = values.iter().position(|v| v == Some(compressed.as_ref()));
-
-        if let Some(idx) = idx {
-            let target_key = idx as u16;
-            let mut buffer_builder = BooleanBufferBuilder::new(self.dictionary_views.len());
-
-            for view in &self.dictionary_views {
-                buffer_builder.append(view.key() == target_key);
+        match &*storage {
+            FsstBufferStorage::InMemory(raw_buffer) => {
+                self.compare_equals_in_memory(needle, raw_buffer)
             }
+            FsstBufferStorage::OnDisk(_) => self.compare_equals_on_disk(needle, &storage),
+        }
+    }
 
-            let buffer = buffer_builder.finish();
-            BooleanArray::new(buffer, self.nulls().cloned())
+    fn compare_equals_with_raw_buffer(
+        &self,
+        needle: &[u8],
+        raw_buffer: &RawFsstBuffer,
+    ) -> BooleanArray {
+        let compressed_needle = self.compressor.compress(needle);
+
+        // Find the matching dictionary value (early exit since values are unique)
+        let num_unique = self.offset_views.len().saturating_sub(1);
+        let mut matching_dict_key = None;
+
+        for i in 0..num_unique {
+            let start_offset = self.offset_views[i].offset();
+            let end_offset = self.offset_views[i + 1].offset();
+
+            let compressed_value = raw_buffer.get_compressed_slice(start_offset, end_offset);
+            if compressed_value == compressed_needle.as_slice() {
+                matching_dict_key = Some(i as u16);
+                break; // Early exit - dictionary values are unique
+            }
+        }
+        let Some(matching_dict_key) = matching_dict_key else {
+            return BooleanArray::new(
+                BooleanBuffer::new_unset(self.dictionary_keys.len()),
+                self.nulls().cloned(),
+            );
+        };
+
+        let to_compare = UInt16Array::new_scalar(matching_dict_key);
+        arrow::compute::kernels::cmp::eq(&self.dictionary_keys, &to_compare).unwrap()
+    }
+
+    fn compare_equals_in_memory(
+        &self,
+        needle: &[u8],
+        raw_buffer: &Arc<RawFsstBuffer>,
+    ) -> BooleanArray {
+        self.compare_equals_with_raw_buffer(needle, raw_buffer)
+    }
+
+    fn compare_equals_on_disk(&self, needle: &[u8], storage: &FsstBufferStorage) -> BooleanArray {
+        let needle_suffix = &needle[self.shared_prefix.len()..];
+
+        // Try to decide from prefixes only
+        let num_unique = self.offset_views.len().saturating_sub(1);
+        let mut matching_dict_key = None;
+        let mut needs_full_comparison = false;
+
+        for i in 0..num_unique {
+            let prefix = self.offset_views[i].prefix();
+
+            if needle_suffix.len() <= 8 {
+                // Can decide from prefix alone
+                let mut needle_prefix = [0u8; 8];
+                let needle_prefix_len = std::cmp::min(needle_suffix.len(), 8);
+                needle_prefix[..needle_prefix_len]
+                    .copy_from_slice(&needle_suffix[..needle_prefix_len]);
+                if *prefix == needle_prefix {
+                    matching_dict_key = Some(i as u16);
+                    break;
+                }
+            } else {
+                // Check if prefix matches
+                if prefix[..8] == needle_suffix[..8] {
+                    // Can't decide from prefix alone - need full comparison
+                    needs_full_comparison = true;
+                    break;
+                }
+            }
+        }
+
+        if needs_full_comparison {
+            // Load raw buffer temporarily and use common comparison logic
+            let raw_buffer = storage.get_raw_buffer().unwrap();
+            self.compare_equals_with_raw_buffer(needle, &raw_buffer)
         } else {
-            let buffer = BooleanBuffer::new_unset(self.dictionary_views.len());
-            BooleanArray::new(buffer, self.nulls().cloned())
+            // Can decide from prefixes only - build result
+            match matching_dict_key {
+                Some(matching_dict_key) => {
+                    let to_compare = UInt16Array::new_scalar(matching_dict_key);
+                    arrow::compute::kernels::cmp::eq(&self.dictionary_keys, &to_compare).unwrap()
+                }
+                None => BooleanArray::new(
+                    BooleanBuffer::new_unset(self.dictionary_keys.len()),
+                    self.nulls().cloned(),
+                ),
+            }
         }
     }
 
@@ -664,7 +670,7 @@ impl LiquidByteViewArray {
 
             // Handle ordering operations with prefix optimization
             Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq => {
-                self.compare_with_prefix_optimization(needle, op)
+                self.compare_with_inner(needle, op)
             }
 
             // For other operations, fall back to Arrow operations
@@ -679,20 +685,17 @@ impl LiquidByteViewArray {
         op: &Operator,
     ) -> Option<BooleanArray> {
         let shared_prefix_len = self.shared_prefix.len();
-        if shared_prefix_len == 0 || needle.is_empty() {
-            return None;
-        }
 
         let needle_shared_len = std::cmp::min(needle.len(), shared_prefix_len);
         let shared_cmp = self.shared_prefix[..needle_shared_len].cmp(&needle[..needle_shared_len]);
 
         let all_true = || {
-            let buffer = BooleanBuffer::new_set(self.dictionary_views.len());
+            let buffer = BooleanBuffer::new_set(self.dictionary_keys.len());
             BooleanArray::new(buffer, self.nulls().cloned())
         };
 
         let all_false = || {
-            let buffer = BooleanBuffer::new_unset(self.dictionary_views.len());
+            let buffer = BooleanBuffer::new_unset(self.dictionary_keys.len());
             BooleanArray::new(buffer, self.nulls().cloned())
         };
 
@@ -732,116 +735,119 @@ impl LiquidByteViewArray {
         }
     }
 
-    /// Compare two byte slices directly (decompressed data now contains full strings)
-    fn compare_bytes_with_shared_prefix(
-        &self,
-        decompressed_full: &[u8],
-        needle: &[u8],
-        op: &Operator,
-    ) -> bool {
-        // Decompressed data now contains full strings, so compare directly
-        match op {
-            Operator::Lt => decompressed_full < needle,
-            Operator::LtEq => decompressed_full <= needle,
-            Operator::Gt => decompressed_full > needle,
-            Operator::GtEq => decompressed_full >= needle,
-            _ => unreachable!("Should only be called with comparison operators"),
-        }
-    }
-
-    /// Compare individual elements using prefix optimization
-    fn compare_individual_elements(
-        &self,
-        needle: &[u8],
-        op: &Operator,
-    ) -> Result<BooleanArray, ArrowError> {
-        let shared_prefix_len = self.shared_prefix.len();
-        let needle_after_shared = if shared_prefix_len < needle.len() {
-            &needle[shared_prefix_len..]
-        } else {
-            &[]
-        };
-
-        // Extract needle prefix from the part after shared prefix (for comparing with DictionaryView prefix)
-        let mut needle_prefix = [0u8; 6];
-        let prefix_len = std::cmp::min(needle_after_shared.len(), 6);
-        needle_prefix[..prefix_len].copy_from_slice(&needle_after_shared[..prefix_len]);
-
-        let mut buffer_builder = BooleanBufferBuilder::new(self.dictionary_views.len());
-        let storage = self.fsst_buffer.read().unwrap();
-        let decompressor = storage.get_decompressor();
-
-        // Only load the full FSST array if we encounter any equal prefixes
-        let mut fsst_array: Option<Arc<FsstArray>> = None;
-
-        for view in &self.dictionary_views {
-            let prefix_cmp = view.prefix().cmp(&needle_prefix);
-
-            let result = match (op, prefix_cmp) {
-                (Operator::Lt, std::cmp::Ordering::Less) => true,
-                (Operator::Lt, std::cmp::Ordering::Greater) => false,
-                (Operator::LtEq, std::cmp::Ordering::Less) => true,
-                (Operator::LtEq, std::cmp::Ordering::Greater) => false,
-                (Operator::Gt, std::cmp::Ordering::Greater) => true,
-                (Operator::Gt, std::cmp::Ordering::Less) => false,
-                (Operator::GtEq, std::cmp::Ordering::Greater) => true,
-                (Operator::GtEq, std::cmp::Ordering::Less) => false,
-
-                // When prefixes are equal, we need to decompress and compare
-                (
-                    Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq,
-                    std::cmp::Ordering::Equal,
-                ) => {
-                    let key = view.key() as usize;
-
-                    // Lazy load the full FSST array only when we need it
-                    if fsst_array.is_none() {
-                        fsst_array = Some(storage.get_fsst_array().unwrap());
-                    }
-                    let fsst_array_ref = fsst_array.as_ref().unwrap();
-
-                    if key < fsst_array_ref.compressed.len()
-                        && !fsst_array_ref.compressed.is_null(key)
-                    {
-                        let compressed_value = fsst_array_ref.compressed.value(key);
-                        let decompressed_bytes = decompressor.decompress(compressed_value);
-
-                        // Compare without creating full_value allocation
-                        self.compare_bytes_with_shared_prefix(&decompressed_bytes, needle, op)
-                    } else {
-                        // Handle null case - nulls are typically considered "less than" any value
-                        matches!(op, Operator::Lt | Operator::LtEq)
-                    }
-                }
-
-                // For all other operators that this method shouldn't handle
-                _ => {
-                    unreachable!(
-                        "compare_individual_elements should only be called with comparison operators"
-                    )
-                }
-            };
-
-            buffer_builder.append(result);
-        }
-
-        let buffer = buffer_builder.finish();
-        Ok(BooleanArray::new(buffer, self.nulls().cloned()))
-    }
-
     /// Prefix optimization for ordering operations
-    fn compare_with_prefix_optimization(
-        &self,
-        needle: &[u8],
-        op: &Operator,
-    ) -> Result<BooleanArray, ArrowError> {
+    fn compare_with_inner(&self, needle: &[u8], op: &Operator) -> Result<BooleanArray, ArrowError> {
         // Try to short-circuit based on shared prefix comparison
         if let Some(result) = self.try_shared_prefix_short_circuit(needle, op) {
             return Ok(result);
         }
 
-        // Fall back to individual element comparison
-        self.compare_individual_elements(needle, op)
+        let needle_suffix = &needle[self.shared_prefix.len()..];
+        let num_unique = self.offset_views.len().saturating_sub(1);
+        let mut dict_results = Vec::with_capacity(num_unique);
+        let mut needs_full_comparison = Vec::new();
+
+        // Try prefix comparison for each unique value
+        for i in 0..num_unique {
+            let prefix = self.offset_views[i].prefix();
+
+            // Compare prefix with needle_suffix
+            let cmp_len = std::cmp::min(8, needle_suffix.len());
+            let prefix_slice = &prefix[..cmp_len];
+            let needle_slice = &needle_suffix[..cmp_len];
+
+            match prefix_slice.cmp(needle_slice) {
+                std::cmp::Ordering::Less => {
+                    // Prefix < needle, so full string < needle
+                    let result = match op {
+                        Operator::Lt | Operator::LtEq => Some(true),
+                        Operator::Gt | Operator::GtEq => Some(false),
+                        _ => None,
+                    };
+                    dict_results.push(result);
+                }
+                std::cmp::Ordering::Greater => {
+                    // Prefix > needle, so full string > needle
+                    let result = match op {
+                        Operator::Lt | Operator::LtEq => Some(false),
+                        Operator::Gt | Operator::GtEq => Some(true),
+                        _ => None,
+                    };
+                    dict_results.push(result);
+                }
+                std::cmp::Ordering::Equal => {
+                    dict_results.push(None);
+                    needs_full_comparison.push(i);
+                }
+            }
+        }
+
+        // For values needing full comparison, load buffer and decompress
+        if !needs_full_comparison.is_empty() {
+            let storage = self.fsst_buffer.read().unwrap();
+            let raw_buffer = storage
+                .get_raw_buffer()
+                .map_err(|e| ArrowError::IoError(format!("Failed to load FSST buffer: {e}"), e))?;
+
+            let mut decompressed_buffer = Vec::with_capacity(1024 * 1024 * 2);
+            for &i in &needs_full_comparison {
+                let start_offset = self.offset_views[i].offset();
+                let end_offset = self.offset_views[i + 1].offset();
+
+                let compressed_value = raw_buffer.get_compressed_slice(start_offset, end_offset);
+                decompressed_buffer.clear();
+                let decompressed_len = unsafe {
+                    let slice = std::slice::from_raw_parts_mut(
+                        decompressed_buffer.as_mut_ptr() as *mut std::mem::MaybeUninit<u8>,
+                        decompressed_buffer.capacity(),
+                    );
+                    self.compressor
+                        .decompressor()
+                        .decompress_into(compressed_value, slice)
+                };
+                unsafe {
+                    decompressed_buffer.set_len(decompressed_len);
+                }
+
+                let value_cmp = decompressed_buffer.as_slice().cmp(needle);
+                let result = match (op, value_cmp) {
+                    (Operator::Lt, std::cmp::Ordering::Less) => Some(true),
+                    (Operator::Lt, _) => Some(false),
+                    (Operator::LtEq, std::cmp::Ordering::Less | std::cmp::Ordering::Equal) => {
+                        Some(true)
+                    }
+                    (Operator::LtEq, _) => Some(false),
+                    (Operator::Gt, std::cmp::Ordering::Greater) => Some(true),
+                    (Operator::Gt, _) => Some(false),
+                    (Operator::GtEq, std::cmp::Ordering::Greater | std::cmp::Ordering::Equal) => {
+                        Some(true)
+                    }
+                    (Operator::GtEq, _) => Some(false),
+                    _ => None,
+                };
+                dict_results[i] = result;
+            }
+        }
+
+        // Map dictionary results to array results
+        let mut builder = BooleanBuilder::with_capacity(self.dictionary_keys.len());
+        for &dict_key in self.dictionary_keys.values().iter() {
+            let matches = if dict_key as usize >= dict_results.len() {
+                false
+            } else {
+                dict_results[dict_key as usize].unwrap_or(false)
+            };
+            builder.append_value(matches);
+        }
+
+        let mut result = builder.finish();
+        // Preserve nulls from dictionary keys
+        if let Some(nulls) = self.nulls() {
+            let (values, _) = result.into_parts();
+            result = BooleanArray::new(values, Some(nulls.clone()));
+        }
+
+        Ok(result)
     }
 
     /// Fallback to Arrow operations for unsupported operations
@@ -880,18 +886,16 @@ impl LiquidByteViewArray {
         let mut storage = self.fsst_buffer.write().unwrap();
 
         match &*storage {
-            FsstBufferStorage::InMemory(fsst_array) => {
-                let mut buffer = Vec::new();
-                fsst_array.to_bytes(&mut buffer);
+            FsstBufferStorage::InMemory(raw_buffer) => {
+                let buffer = raw_buffer.to_bytes();
 
                 let mut file = File::create(&path)?;
                 file.write_all(&buffer)?;
 
-                let compressor = Arc::new(fsst_array.compressor().clone());
-                *storage = FsstBufferStorage::OnDisk(path, compressor);
+                *storage = FsstBufferStorage::OnDisk(path);
                 Ok(())
             }
-            FsstBufferStorage::OnDisk(_, _) => Ok(()),
+            FsstBufferStorage::OnDisk(_) => Ok(()),
         }
     }
 
@@ -900,11 +904,11 @@ impl LiquidByteViewArray {
         let mut storage = self.fsst_buffer.write().unwrap();
 
         match &*storage {
-            FsstBufferStorage::OnDisk(path, compressor) => {
+            FsstBufferStorage::OnDisk(path) => {
                 let bytes = std::fs::read(path)?;
                 let bytes = bytes::Bytes::from(bytes);
-                let fsst_array = FsstArray::from_bytes(bytes, compressor.clone());
-                *storage = FsstBufferStorage::InMemory(Arc::new(fsst_array));
+                let raw_buffer = RawFsstBuffer::from_bytes(bytes);
+                *storage = FsstBufferStorage::InMemory(Arc::new(raw_buffer));
                 Ok(())
             }
             FsstBufferStorage::InMemory(_) => Ok(()),
@@ -932,6 +936,165 @@ impl LiquidByteViewArray {
     pub fn reset_disk_read_count(&self) {
         reset_disk_read_counter()
     }
+
+    /// Get detailed memory usage of the byte view array
+    pub fn get_detailed_memory_usage(&self) -> ByteViewArrayMemoryUsage {
+        ByteViewArrayMemoryUsage {
+            dictionary_key: self.dictionary_keys.get_array_memory_size(),
+            offsets: self.offset_views.len() * std::mem::size_of::<OffsetView>(),
+            fsst_buffer: self.fsst_buffer.read().unwrap().get_array_memory_size(),
+            shared_prefix: self.shared_prefix.len(),
+            struct_size: std::mem::size_of::<Self>(),
+        }
+    }
+
+    /// Sort the array and return indices that would sort the array
+    /// This implements efficient sorting as described in the design document:
+    /// 1. First sort the dictionary using prefixes to delay decompression
+    /// 2. If decompression is needed, decompress the entire array at once
+    /// 3. Use dictionary ranks to sort the final keys
+    pub fn sort_to_indices(&self) -> Result<UInt32Array, ArrowError> {
+        // if distinct ratio is more than 10%, use arrow sort.
+        if self.offset_views.len() > (self.dictionary_keys.len() / 10) {
+            let array = self.to_dict_arrow();
+            let sorted_array = sort_to_indices(&array, None, None)?;
+            Ok(sorted_array)
+        } else {
+            Ok(self.sort_to_indices_inner())
+        }
+    }
+
+    fn sort_to_indices_inner(&self) -> UInt32Array {
+        // Step 1: Get dictionary ranks using prefix optimization
+        let dict_ranks = self.get_dictionary_ranks();
+
+        // Step 2: Partition array indices into nulls and non-nulls, then sort non-nulls
+        let mut non_null_indices = Vec::with_capacity(self.dictionary_keys.len());
+
+        let mut array_indices = Vec::with_capacity(self.dictionary_keys.len());
+        for array_idx in 0..self.dictionary_keys.len() as u32 {
+            if self.dictionary_keys.is_null(array_idx as usize) {
+                array_indices.push(array_idx);
+            } else {
+                non_null_indices.push(array_idx);
+            }
+        }
+
+        // Sort non-null indices by their dictionary ranks
+        non_null_indices.sort_unstable_by_key(|&array_idx| unsafe {
+            let dict_key = self.dictionary_keys.value_unchecked(array_idx as usize);
+            dict_ranks.get_unchecked(dict_key as usize)
+        });
+
+        array_indices.extend(non_null_indices);
+
+        UInt32Array::from(array_indices)
+    }
+
+    /// Get dictionary ranks using prefix optimization and lazy decompression
+    /// Returns a mapping from dictionary key to its rank in sorted order
+    fn get_dictionary_ranks(&self) -> Vec<u16> {
+        let num_unique = self.offset_views.len().saturating_sub(1);
+        let mut dict_indices: Vec<u32> = (0..num_unique as u32).collect();
+
+        let mut decompressed: Option<BinaryArray> = None;
+
+        // Sort using prefix optimization first, then full strings when needed
+        dict_indices.sort_unstable_by(|&a, &b| unsafe {
+            // First try prefix comparison - no need to include shared_prefix since all strings have it
+            let prefix_a = self.offset_views.get_unchecked(a as usize).prefix();
+            let prefix_b = self.offset_views.get_unchecked(b as usize).prefix();
+
+            let prefix_cmp = prefix_a.cmp(prefix_b);
+
+            if prefix_cmp != std::cmp::Ordering::Equal {
+                // Prefix comparison is sufficient
+                prefix_cmp
+            } else {
+                // Prefixes are equal, need full string comparison
+                // This will trigger decompression on first call if needed
+                match &decompressed {
+                    Some(decompressed) => {
+                        let string_a = decompressed.value_unchecked(a as usize);
+                        let string_b = decompressed.value_unchecked(b as usize);
+                        string_a.cmp(string_b)
+                    }
+                    None => {
+                        let storage_guard = self.fsst_buffer.read().unwrap();
+                        let raw_buffer = storage_guard.get_raw_buffer().unwrap();
+
+                        let (values_buffer, offsets_buffer) = raw_buffer
+                            .to_uncompressed(&self.compressor.decompressor(), &self.offset_views);
+
+                        let binary_array =
+                            BinaryArray::new_unchecked(offsets_buffer, values_buffer, None);
+
+                        let string_a = binary_array.value(a as usize);
+                        let string_b = binary_array.value(b as usize);
+                        let rt = string_a.cmp(string_b);
+                        decompressed = Some(binary_array);
+                        rt
+                    }
+                }
+            }
+        });
+
+        // Convert sorted indices to rank mapping
+        let mut dict_ranks = vec![0u16; dict_indices.len()];
+        for (rank, dict_key) in dict_indices.into_iter().enumerate() {
+            dict_ranks[dict_key as usize] = rank as u16;
+        }
+
+        dict_ranks
+    }
+}
+
+/// Detailed memory usage of the byte view array
+pub struct ByteViewArrayMemoryUsage {
+    /// Memory usage of the dictionary key
+    pub dictionary_key: usize,
+    /// Memory usage of the offset views
+    pub offsets: usize,
+    /// Memory usage of the FSST buffer
+    pub fsst_buffer: usize,
+    /// Memory usage of the shared prefix
+    pub shared_prefix: usize,
+    /// Memory usage of the struct size
+    pub struct_size: usize,
+}
+
+impl Display for ByteViewArrayMemoryUsage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ByteViewArrayMemoryUsage")
+            .field("dictionary_key", &self.dictionary_key)
+            .field("offsets", &self.offsets)
+            .field("fsst_buffer", &self.fsst_buffer)
+            .field("shared_prefix", &self.shared_prefix)
+            .field("struct_size", &self.struct_size)
+            .field("total", &self.total())
+            .finish()
+    }
+}
+
+impl ByteViewArrayMemoryUsage {
+    /// Get the total memory usage of the byte view array
+    pub fn total(&self) -> usize {
+        self.dictionary_key
+            + self.offsets
+            + self.fsst_buffer
+            + self.shared_prefix
+            + self.struct_size
+    }
+}
+
+impl std::ops::AddAssign for ByteViewArrayMemoryUsage {
+    fn add_assign(&mut self, other: Self) {
+        self.dictionary_key += other.dictionary_key;
+        self.offsets += other.offsets;
+        self.fsst_buffer += other.fsst_buffer;
+        self.shared_prefix += other.shared_prefix;
+        self.struct_size += other.struct_size;
+    }
 }
 
 #[cfg(test)]
@@ -955,41 +1118,19 @@ mod tests {
     }
 
     #[test]
-    fn test_simple_roundtrip() {
-        let input = StringArray::from(vec!["hello", "world", "hello", "rust"]);
-        test_string_roundtrip(input);
-    }
-
-    #[test]
     fn test_roundtrip_with_nulls() {
         let input = StringArray::from(vec![
             Some("hello"),
             None,
             Some("world"),
             None,
+            Some("This is a very long string that should be compressed well"),
             Some("hello"),
+            Some(""),
+            Some("This is a very long string that should be compressed well"),
         ]);
         test_string_roundtrip(input);
     }
-
-    #[test]
-    fn test_roundtrip_with_long_strings() {
-        let input = StringArray::from(vec![
-            "This is a very long string that should be compressed well",
-            "Another long string with some common patterns",
-            "This is a very long string that should be compressed well",
-            "Some unique text here to mix things up",
-            "Another long string with some common patterns",
-        ]);
-        test_string_roundtrip(input);
-    }
-
-    #[test]
-    fn test_empty_strings() {
-        let input = StringArray::from(vec!["", "", "non-empty", ""]);
-        test_string_roundtrip(input);
-    }
-
     #[test]
     fn test_string_view_roundtrip() {
         let input = StringViewArray::from(vec![
@@ -998,6 +1139,9 @@ mod tests {
             Some("hello"),
             Some("rust"),
             None,
+            Some("This is a very long string that should be compressed well"),
+            Some(""),
+            Some("This is a very long string that should be compressed well"),
         ]);
 
         let (_compressor, liquid_array) = LiquidByteViewArray::train_from_string_view(&input);
@@ -1013,6 +1157,9 @@ mod tests {
             Some(b"hello".as_slice()),
             Some(b"rust\x00".as_slice()),
             None,
+            Some(b"This is a very long string that should be compressed well"),
+            Some(b""),
+            Some(b"This is a very long string that should be compressed well"),
         ]);
 
         let (_compressor, liquid_array) = LiquidByteViewArray::train_from_binary_view(&input);
@@ -1070,9 +1217,16 @@ mod tests {
 
     #[test]
     fn test_dictionary_view_structure() {
-        let view = DictionaryView::new(42, [1, 2, 3, 4, 5, 6]);
-        assert_eq!(view.key(), 42);
-        assert_eq!(view.prefix(), &[1, 2, 3, 4, 5, 6]);
+        // Test OffsetView structure
+        let offset_view = OffsetView::new(1024, [1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(offset_view.offset(), 1024);
+        assert_eq!(offset_view.prefix(), &[1, 2, 3, 4, 5, 6, 7, 8]);
+
+        // Test UInt16Array creation (dictionary keys are now stored directly in UInt16Array)
+        let keys = UInt16Array::from(vec![42, 100, 255]);
+        assert_eq!(keys.value(0), 42);
+        assert_eq!(keys.value(1), 100);
+        assert_eq!(keys.value(2), 255);
     }
 
     #[test]
@@ -1081,11 +1235,11 @@ mod tests {
         let compressor = LiquidByteViewArray::train_compressor(input.iter());
         let liquid_array = LiquidByteViewArray::from_string_array(&input, compressor);
 
-        // With no shared prefix, the dictionary prefixes should be the original strings (truncated to 6 bytes)
+        // With no shared prefix, the offset view prefixes should be the original strings (truncated to 8 bytes)
         assert_eq!(liquid_array.shared_prefix, Vec::<u8>::new());
-        assert_eq!(liquid_array.dictionary_views[0].prefix(), b"hello\0");
-        assert_eq!(liquid_array.dictionary_views[1].prefix(), b"world\0");
-        assert_eq!(liquid_array.dictionary_views[2].prefix(), b"test\0\0");
+        assert_eq!(liquid_array.offset_views[0].prefix(), b"hello\0\0\0");
+        assert_eq!(liquid_array.offset_views[1].prefix(), b"world\0\0\0");
+        assert_eq!(liquid_array.offset_views[2].prefix(), b"test\0\0\0\0");
     }
 
     #[test]
@@ -1103,11 +1257,11 @@ mod tests {
         // Should extract "hello_" as shared prefix
         assert_eq!(liquid_array.shared_prefix, b"hello_");
 
-        // Dictionary prefixes should be the remaining parts after shared prefix
-        assert_eq!(liquid_array.dictionary_views[0].prefix(), b"world\0");
-        assert_eq!(liquid_array.dictionary_views[1].prefix(), b"rust\0\0");
-        assert_eq!(liquid_array.dictionary_views[2].prefix(), b"test\0\0");
-        assert_eq!(liquid_array.dictionary_views[3].prefix(), b"code\0\0");
+        // Offset view prefixes should be the remaining parts after shared prefix (8 bytes)
+        assert_eq!(liquid_array.offset_views[0].prefix(), b"world\0\0\0");
+        assert_eq!(liquid_array.offset_views[1].prefix(), b"rust\0\0\0\0");
+        assert_eq!(liquid_array.offset_views[2].prefix(), b"test\0\0\0\0");
+        assert_eq!(liquid_array.offset_views[3].prefix(), b"code\0\0\0\0");
 
         // Test roundtrip - should reconstruct original strings correctly
         let output = liquid_array.to_arrow_array();
@@ -1139,11 +1293,11 @@ mod tests {
         // Should extract "abc" as shared prefix
         assert_eq!(liquid_array.shared_prefix, b"abc");
 
-        // Dictionary prefixes should be the remaining parts after shared prefix
-        assert_eq!(liquid_array.dictionary_views[0].prefix(), &[0u8; 6]); // empty after "abc"
-        assert_eq!(liquid_array.dictionary_views[1].prefix(), b"de\0\0\0\0"); // "de" after "abc"
-        assert_eq!(liquid_array.dictionary_views[2].prefix(), b"def\0\0\0"); // "def" after "abc"
-        assert_eq!(liquid_array.dictionary_views[3].prefix(), b"defg\0\0"); // "defg" after "abc"
+        // Offset view prefixes should be the remaining parts after shared prefix (8 bytes)
+        assert_eq!(liquid_array.offset_views[0].prefix(), &[0u8; 8]); // empty after "abc"
+        assert_eq!(liquid_array.offset_views[1].prefix(), b"de\0\0\0\0\0\0"); // "de" after "abc"
+        assert_eq!(liquid_array.offset_views[2].prefix(), b"def\0\0\0\0\0"); // "def" after "abc"
+        assert_eq!(liquid_array.offset_views[3].prefix(), b"defg\0\0\0\0"); // "defg" after "abc"
 
         // Test roundtrip
         let output = liquid_array.to_arrow_array();
@@ -1178,12 +1332,12 @@ mod tests {
         // Should extract "data" as shared prefix
         assert_eq!(liquid_array.shared_prefix, b"data");
 
-        // Dictionary prefixes should be the remaining parts
-        assert_eq!(liquid_array.dictionary_views[0].prefix(), &[0u8; 6]); // "data" - empty remainder
-        assert_eq!(liquid_array.dictionary_views[1].prefix(), b"base\0\0"); // "database" - "base" remainder
-        assert_eq!(liquid_array.dictionary_views[2].prefix(), b"_entry"); // "data_entry" - "_entry" remainder
-        assert_eq!(liquid_array.dictionary_views[3].prefix(), b"_\0\0\0\0\0"); // "data_" - "_" remainder
-        assert_eq!(liquid_array.dictionary_views[4].prefix(), b"type\0\0"); // "datatype" - "type" remainder
+        // Offset view prefixes should be the remaining parts (8 bytes)
+        assert_eq!(liquid_array.offset_views[0].prefix(), &[0u8; 8]); // "data" - empty remainder
+        assert_eq!(liquid_array.offset_views[1].prefix(), b"base\0\0\0\0"); // "database" - "base" remainder
+        assert_eq!(liquid_array.offset_views[2].prefix(), b"_entry\0\0"); // "data_entry" - "_entry" remainder
+        assert_eq!(liquid_array.offset_views[3].prefix(), b"_\0\0\0\0\0\0\0"); // "data_" - "_" remainder
+        assert_eq!(liquid_array.offset_views[4].prefix(), b"type\0\0\0\0"); // "datatype" - "type" remainder
 
         // Test roundtrip
         let output = liquid_array.to_arrow_array();
@@ -1219,6 +1373,16 @@ mod tests {
     }
 
     #[test]
+    fn test_shared_prefix_corner_case() {
+        let input = StringArray::from(vec!["data", "database", "data_entry", "data_", "datatype"]);
+        let compressor = LiquidByteViewArray::train_compressor(input.iter());
+        let liquid_array = LiquidByteViewArray::from_string_array(&input, compressor);
+        let result = liquid_array.compare_with(b"data", &Operator::GtEq).unwrap();
+        let expected = BooleanArray::from(vec![true, true, true, true, true]); // All >= "data"
+        assert_eq!(result, expected);
+    }
+
+    #[test]
     fn test_shared_prefix_edge_cases() {
         // Test case 1: All strings are the same (full shared prefix)
         let input = StringArray::from(vec!["identical", "identical", "identical"]);
@@ -1226,9 +1390,9 @@ mod tests {
         let liquid_array = LiquidByteViewArray::from_string_array(&input, compressor);
 
         assert_eq!(liquid_array.shared_prefix, b"identical");
-        // All dictionary prefixes should be empty
-        for view in &liquid_array.dictionary_views {
-            assert_eq!(view.prefix(), &[0u8; 6]);
+        // All offset view prefixes should be empty
+        for offset_view in &liquid_array.offset_views {
+            assert_eq!(offset_view.prefix(), &[0u8; 8]);
         }
 
         // Test roundtrip
@@ -1241,9 +1405,9 @@ mod tests {
         let liquid_array = LiquidByteViewArray::from_string_array(&input, compressor);
 
         assert_eq!(liquid_array.shared_prefix, b"hello");
-        assert_eq!(liquid_array.dictionary_views[0].prefix(), &[0u8; 6]); // empty after "hello"
-        assert_eq!(liquid_array.dictionary_views[1].prefix(), b"_world");
-        assert_eq!(liquid_array.dictionary_views[2].prefix(), b"_test\0");
+        assert_eq!(liquid_array.offset_views[0].prefix(), &[0u8; 8]); // empty after "hello"
+        assert_eq!(liquid_array.offset_views[1].prefix(), b"_world\0\0");
+        assert_eq!(liquid_array.offset_views[2].prefix(), b"_test\0\0\0");
 
         // Test roundtrip
         let output = liquid_array.to_arrow_array();
@@ -1255,9 +1419,9 @@ mod tests {
         let liquid_array = LiquidByteViewArray::from_string_array(&input, compressor);
 
         assert_eq!(liquid_array.shared_prefix, Vec::<u8>::new()); // empty shared prefix
-        assert_eq!(liquid_array.dictionary_views[0].prefix(), &[0u8; 6]);
-        assert_eq!(liquid_array.dictionary_views[1].prefix(), b"hello\0");
-        assert_eq!(liquid_array.dictionary_views[2].prefix(), b"hello_");
+        assert_eq!(liquid_array.offset_views[0].prefix(), &[0u8; 8]);
+        assert_eq!(liquid_array.offset_views[1].prefix(), b"hello\0\0\0");
+        assert_eq!(liquid_array.offset_views[2].prefix(), b"hello_wo"); // "hello_world" truncated to 8 bytes
 
         // Test roundtrip
         let output = liquid_array.to_arrow_array();
@@ -1271,17 +1435,15 @@ mod tests {
         let liquid_array = LiquidByteViewArray::from_string_array(&input, compressor);
 
         // Verify memory layout components
-        assert_eq!(liquid_array.dictionary_views.len(), 3);
-        // Offsets has one more element than unique values (standard offset buffer format)
-        assert_eq!(liquid_array.offsets.len(), 4); // 3 unique values + 1 = 4 offsets
-        assert!(liquid_array.nulls.is_none());
-        let fsst_array = liquid_array
+        assert_eq!(liquid_array.dictionary_keys.len(), 3);
+        assert_eq!(liquid_array.offset_views.len(), 4);
+        assert!(liquid_array.nulls().is_none());
+        let _raw_buffer = liquid_array
             .fsst_buffer
             .read()
             .unwrap()
-            .get_fsst_array()
+            .get_raw_buffer()
             .unwrap();
-        assert!(!fsst_array.compressed.is_empty());
     }
 
     #[test]
@@ -1306,7 +1468,7 @@ mod tests {
         let liquid_array = LiquidByteViewArray::from_string_array(&input, compressor);
 
         // Verify that dictionary views store unique values efficiently
-        assert_eq!(liquid_array.dictionary_views.len(), 5);
+        assert_eq!(liquid_array.dictionary_keys.len(), 5);
 
         // Verify that FSST buffer contains unique values
         let dict = liquid_array.to_dict_arrow();
@@ -1339,26 +1501,6 @@ mod tests {
     }
 
     #[test]
-    fn test_decompressor_access() {
-        let input = StringArray::from(vec!["hello", "world"]);
-        let compressor = LiquidByteViewArray::train_compressor(input.iter());
-        let liquid_array = LiquidByteViewArray::from_string_array(&input, compressor);
-
-        // Just verify we can get the decompressor without errors
-        let fsst_array = liquid_array
-            .fsst_buffer
-            .read()
-            .unwrap()
-            .get_fsst_array()
-            .unwrap();
-        let _decompressor = fsst_array.decompressor();
-        assert_eq!(
-            fsst_array.compressor().symbol_table().len(),
-            fsst_array.compressor().symbol_table().len()
-        );
-    }
-
-    #[test]
     fn test_compare_with_prefix_optimization_fast_path() {
         // Test case 1: Prefix comparison can decide most results without decompression
         // Uses strings with distinct prefixes to test the fast path
@@ -1376,7 +1518,7 @@ mod tests {
         // Test Lt with needle "car" (prefix: "car\0\0\0")
         // Expected: "apple123" < "car" => true, "banana456" < "car" => true, others false
         let result = liquid_array
-            .compare_with_prefix_optimization(b"car", &Operator::Lt)
+            .compare_with_inner(b"car", &Operator::Lt)
             .unwrap();
         let expected = BooleanArray::from(vec![true, true, false, true, false]);
         assert_eq!(result, expected);
@@ -1384,7 +1526,7 @@ mod tests {
         // Test Gt with needle "dog" (prefix: "dog\0\0\0")
         // Expected: only "zebra000" > "dog" => true
         let result = liquid_array
-            .compare_with_prefix_optimization(b"dog", &Operator::Gt)
+            .compare_with_inner(b"dog", &Operator::Gt)
             .unwrap();
         let expected = BooleanArray::from(vec![false, false, false, false, true]);
         assert_eq!(result, expected);
@@ -1392,7 +1534,7 @@ mod tests {
         // Test GtEq with needle "apple" (prefix: "apple\0")
         // Expected: all except "apple123" and "apple999" need decompression, others by prefix
         let result = liquid_array
-            .compare_with_prefix_optimization(b"apple", &Operator::GtEq)
+            .compare_with_inner(b"apple", &Operator::GtEq)
             .unwrap();
         let expected = BooleanArray::from(vec![true, true, true, true, true]);
         assert_eq!(result, expected);
@@ -1416,21 +1558,21 @@ mod tests {
         // Test Lt with needle "prefix_b" - this will require decompression for prefix matches
         // Expected: "prefix_aaa" < "prefix_b" => true, "prefix_bbb" < "prefix_b" => false, etc.
         let result = liquid_array
-            .compare_with_prefix_optimization(b"prefix_b", &Operator::Lt)
+            .compare_with_inner(b"prefix_b", &Operator::Lt)
             .unwrap();
         let expected = BooleanArray::from(vec![true, false, false, true, true]);
         assert_eq!(result, expected);
 
         // Test LtEq with needle "prefix_bbb" - exact match case with decompression
         let result = liquid_array
-            .compare_with_prefix_optimization(b"prefix_bbb", &Operator::LtEq)
+            .compare_with_inner(b"prefix_bbb", &Operator::LtEq)
             .unwrap();
         let expected = BooleanArray::from(vec![true, true, false, true, true]);
         assert_eq!(result, expected);
 
         // Test Gt with needle "prefix_abc" - requires decompression for prefix matches
         let result = liquid_array
-            .compare_with_prefix_optimization(b"prefix_abc", &Operator::Gt)
+            .compare_with_inner(b"prefix_abc", &Operator::Gt)
             .unwrap();
         let expected = BooleanArray::from(vec![false, true, true, false, false]);
         assert_eq!(result, expected);
@@ -1452,9 +1594,7 @@ mod tests {
         let liquid_array = LiquidByteViewArray::from_string_array(&input, compressor);
 
         // Test Lt with empty string needle - should test null handling
-        let result = liquid_array
-            .compare_with_prefix_optimization(b"", &Operator::Lt)
-            .unwrap();
+        let result = liquid_array.compare_with_inner(b"", &Operator::Lt).unwrap();
         let expected = BooleanArray::from(vec![
             Some(false),
             None,
@@ -1467,7 +1607,7 @@ mod tests {
 
         // Test Gt with needle "abcdef" - tests exact prefix match requiring decompression
         let result = liquid_array
-            .compare_with_prefix_optimization(b"abcdef", &Operator::Gt)
+            .compare_with_inner(b"abcdef", &Operator::Gt)
             .unwrap();
         let expected = BooleanArray::from(vec![
             Some(false),
@@ -1481,7 +1621,7 @@ mod tests {
 
         // Test LtEq with needle "b" - tests single character comparisons
         let result = liquid_array
-            .compare_with_prefix_optimization(b"b", &Operator::LtEq)
+            .compare_with_inner(b"b", &Operator::LtEq)
             .unwrap();
         let expected = BooleanArray::from(vec![
             Some(true),
@@ -1495,7 +1635,7 @@ mod tests {
 
         // Test GtEq with needle "abcdeg" - tests decompression when prefix exactly matches needle prefix
         let result = liquid_array
-            .compare_with_prefix_optimization(b"abcdeg", &Operator::GtEq)
+            .compare_with_inner(b"abcdeg", &Operator::GtEq)
             .unwrap();
         // b"" >= b"abcdeg" => false
         // null => null
@@ -1533,7 +1673,7 @@ mod tests {
         // Expected: "café" < "naïve" => true (99 < 110), "hello" < "naïve" => true, others false
         let naive_bytes = "naïve".as_bytes(); // [110, 97, 195, 175, 118, 101]
         let result = liquid_array
-            .compare_with_prefix_optimization(naive_bytes, &Operator::Lt)
+            .compare_with_inner(naive_bytes, &Operator::Lt)
             .unwrap();
         let expected = BooleanArray::from(vec![true, false, false, true, false]);
         assert_eq!(result, expected);
@@ -1542,7 +1682,7 @@ mod tests {
         // Expected: strings with first byte > 99 should be true
         let cafe_bytes = "café".as_bytes(); // [99, 97, 102, 195, 169]
         let result = liquid_array
-            .compare_with_prefix_optimization(cafe_bytes, &Operator::Gt)
+            .compare_with_inner(cafe_bytes, &Operator::Gt)
             .unwrap();
         let expected = BooleanArray::from(vec![false, true, true, true, true]);
         assert_eq!(result, expected);
@@ -1552,7 +1692,7 @@ mod tests {
         // most Latin characters will be true
         let world_bytes = "世界".as_bytes(); // [228, 184, 150, 231, 149, 140]
         let result = liquid_array
-            .compare_with_prefix_optimization(world_bytes, &Operator::LtEq)
+            .compare_with_inner(world_bytes, &Operator::LtEq)
             .unwrap();
         let expected = BooleanArray::from(vec![true, true, true, true, true]);
         assert_eq!(result, expected);
@@ -1560,10 +1700,10 @@ mod tests {
         // Test exact equality with "résumé" using GtEq and LtEq to verify byte-level precision
         let resume_bytes = "résumé".as_bytes(); // [114, 195, 169, 115, 117, 109, 195, 169]
         let gte_result = liquid_array
-            .compare_with_prefix_optimization(resume_bytes, &Operator::GtEq)
+            .compare_with_inner(resume_bytes, &Operator::GtEq)
             .unwrap();
         let lte_result = liquid_array
-            .compare_with_prefix_optimization(resume_bytes, &Operator::LtEq)
+            .compare_with_inner(resume_bytes, &Operator::LtEq)
             .unwrap();
 
         // Check GtEq and LtEq results separately
@@ -1642,45 +1782,157 @@ mod tests {
         let _ = std::fs::remove_file(temp_path);
     }
 
-    #[test]
-    fn test_efficient_compressor_decompressor_access() {
-        // Reset counter at start of test to avoid interference from other tests
-        reset_disk_read_counter();
-
-        let input = StringArray::from(vec![
-            "prefix_aaa", // prefix: "prefix"
-            "prefix_bbb", // prefix: "prefix" (same prefix)
-            "prefix_ccc", // prefix: "prefix" (same prefix)
-            "different",  // prefix: "differ" (different prefix)
-        ]);
+    fn sort_to_indices_test(input: Vec<Option<&str>>, expected_idx: Vec<u32>) {
+        let input = StringArray::from(input);
         let compressor = LiquidByteViewArray::train_compressor(input.iter());
         let liquid_array = LiquidByteViewArray::from_string_array(&input, compressor);
+        let indices = liquid_array.sort_to_indices().unwrap();
+        assert_eq!(indices, UInt32Array::from(expected_idx));
+    }
 
-        // Evict to disk to test efficiency
-        let temp_path = std::env::temp_dir().join("test_efficient_access.bin");
+    #[test]
+    fn test_sort_to_indices_basic() {
+        sort_to_indices_test(
+            vec![Some("zebra"), Some("apple"), Some("banana"), Some("cherry")],
+            vec![1, 2, 3, 0],
+        );
+
+        // with nulls
+        sort_to_indices_test(
+            vec![
+                Some("zebra"),
+                None,
+                Some("apple"),
+                Some("banana"),
+                None,
+                Some("cherry"),
+            ],
+            // Expected order: null(1), null(4), apple(2), banana(3), cherry(5), zebra(0)
+            vec![1, 4, 2, 3, 5, 0],
+        );
+
+        // shared prefix
+        sort_to_indices_test(
+            vec![
+                Some("prefix_zebra"),
+                Some("prefix_apple"),
+                Some("prefix_banana"),
+                Some("prefix_cherry"),
+            ],
+            vec![1, 2, 3, 0],
+        );
+
+        // with duplicate values
+        sort_to_indices_test(
+            vec![
+                Some("apple"),
+                Some("banana"),
+                Some("apple"),
+                Some("cherry"),
+                Some("banana"),
+            ],
+            vec![0, 2, 1, 4, 3],
+        );
+    }
+
+    #[test]
+    fn test_sort_to_indices_test_full_data_comparison() {
+        sort_to_indices_test(
+            vec![
+                Some("pre_apple_abc"),
+                Some("pre_banana_abc"),
+                Some("pre_apple_def"),
+            ],
+            vec![0, 2, 1],
+        );
+
+        sort_to_indices_test(
+            vec![
+                Some("pre_apple_abc"),
+                Some("pre_banana_abc"),
+                Some("pre_appll_abc"),
+            ],
+            vec![0, 2, 1],
+        );
+    }
+
+    fn test_compare_equals(input: StringArray, needle: &[u8], expected: BooleanArray) {
+        let temp_file = tempfile::NamedTempFile::new().unwrap();
+        let temp_path = temp_file.path().to_path_buf();
+
+        let compressor = LiquidByteViewArray::train_compressor(input.iter());
+        let liquid_array = LiquidByteViewArray::from_string_array(&input, compressor);
+        let result = liquid_array.compare_equals(needle);
+        assert_eq!(result, expected);
+
         liquid_array.evict_to_disk(temp_path.clone()).unwrap();
+        let disk_result = liquid_array.compare_equals(needle);
+        assert_eq!(disk_result, expected);
+    }
 
-        // Test that we can access compressor and decompressor without loading full array
-        let storage = liquid_array.fsst_buffer.read().unwrap();
-        let _compressor = storage.get_compressor();
-        let _decompressor = storage.get_decompressor();
-
-        // Test prefix optimization - should work efficiently with mostly prefix comparisons
-        // "prefix_b" should be able to determine most results via prefix comparison
-        let result = liquid_array
-            .compare_with(b"prefix_b", &Operator::Lt)
-            .unwrap();
-        let expected = BooleanArray::from(vec![true, false, false, true]);
-        assert_eq!(result, expected);
-
-        // Test that comparison with very different prefix works efficiently
-        // "zzz" should be resolvable by prefix comparison alone for most values
-        let result = liquid_array.compare_with(b"zzz", &Operator::Lt).unwrap();
-        let expected = BooleanArray::from(vec![true, true, true, true]);
-        assert_eq!(result, expected);
-
-        // Cleanup
-        let _ = std::fs::remove_file(temp_path);
+    #[test]
+    fn test_compare_equals_on_disk() {
+        let input = StringArray::from(vec![
+            Some("apple_orange"),
+            None,
+            Some("apple_orange_long_string"),
+            Some("apple_b"),
+            Some("apple_oo_long_string"),
+            Some("apple_b"),
+            Some("apple"),
+        ]);
+        test_compare_equals(
+            input.clone(),
+            b"apple",
+            BooleanArray::from(vec![
+                Some(false),
+                None,
+                Some(false),
+                Some(false),
+                Some(false),
+                Some(false),
+                Some(true),
+            ]),
+        );
+        test_compare_equals(
+            input.clone(),
+            b"",
+            BooleanArray::from(vec![
+                Some(false),
+                None,
+                Some(false),
+                Some(false),
+                Some(false),
+                Some(false),
+                Some(false),
+            ]),
+        );
+        test_compare_equals(
+            input.clone(),
+            b"apple_b",
+            BooleanArray::from(vec![
+                Some(false),
+                None,
+                Some(false),
+                Some(true),
+                Some(false),
+                Some(true),
+                Some(false),
+            ]),
+        );
+        test_compare_equals(
+            input.clone(),
+            b"apple_oo_long_string",
+            BooleanArray::from(vec![
+                Some(false),
+                None,
+                Some(false),
+                Some(false),
+                Some(true),
+                Some(false),
+                Some(false),
+            ]),
+        );
     }
 
     #[test]
@@ -1710,16 +1962,6 @@ mod tests {
         // Reset counter and test operations that should NOT trigger disk reads
         liquid_array.reset_disk_read_count();
 
-        // 1. Get compressor - should not read from disk
-        let storage = liquid_array.fsst_buffer.read().unwrap();
-        let _compressor = storage.get_compressor();
-        assert_eq!(liquid_array.get_disk_read_count(), 0);
-
-        // 2. Get decompressor - should not read from disk
-        let _decompressor = storage.get_decompressor();
-        assert_eq!(liquid_array.get_disk_read_count(), 0);
-        drop(storage);
-
         // 3. Prefix-only comparison (should resolve without disk I/O)
         // "car" < "apple123" is false, "car" < "banana456" is false, etc.
         // All comparisons should be resolved by prefix alone
@@ -1739,19 +1981,19 @@ mod tests {
 
         // 5. Equality comparison - needs to search through compressed values
         let result = liquid_array.compare_equals(b"apple123");
-        assert_eq!(liquid_array.get_disk_read_count(), 1); // Should read once
+        assert_eq!(liquid_array.get_disk_read_count(), 0);
         let expected = BooleanArray::from(vec![true, false, false, false]);
         assert_eq!(result, expected);
 
         // 6. Another equality comparison - should read again (no caching)
         let result = liquid_array.compare_equals(b"banana456");
-        assert_eq!(liquid_array.get_disk_read_count(), 2); // Should read twice total
+        assert_eq!(liquid_array.get_disk_read_count(), 1);
         let expected = BooleanArray::from(vec![false, true, false, false]);
         assert_eq!(result, expected);
 
         // 7. Arrow conversion - needs full data
         let _arrow_array = liquid_array.to_arrow_array();
-        assert_eq!(liquid_array.get_disk_read_count(), 3); // Should read third time
+        assert_eq!(liquid_array.get_disk_read_count(), 2);
 
         // 8. Comparison with equal prefixes (needs decompression)
         let input_equal_prefixes =
