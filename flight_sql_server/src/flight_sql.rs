@@ -48,7 +48,6 @@ use prost::Message;
 use serde::Serialize;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::task::Poll;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 use url::Url;
