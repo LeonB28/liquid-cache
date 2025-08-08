@@ -42,7 +42,7 @@ use datafusion::{error::Result, execution::object_store::ObjectStoreUrl};
 use futures::{StreamExt, TryStreamExt};
 use liquid_cache_client::LiquidCacheBuilder;
 use liquid_cache_common::CacheMode;
-use log::{info, debug};
+use log::{debug, info};
 use once_cell::sync::Lazy;
 use prost::Message;
 use serde::Serialize;
