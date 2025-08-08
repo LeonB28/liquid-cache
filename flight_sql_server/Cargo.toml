@@ -33,3 +33,6 @@ serde = { version = "1.0.219", features = ["derive"] }
 [[bin]]
 name = "flight_sql_server"
 path = "src/flight_sql.rs"
+
+[target.x86_64-unknown-linux-musl]
+linker = "x86_64-linux-musl-gcc"

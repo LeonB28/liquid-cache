@@ -42,7 +42,7 @@ use datafusion::{error::Result, execution::object_store::ObjectStoreUrl};
 use futures::{StreamExt, TryStreamExt};
 use liquid_cache_client::LiquidCacheBuilder;
 use liquid_cache_common::CacheMode;
-use log::info;
+use log::{info, debug};
 use once_cell::sync::Lazy;
 use prost::Message;
 use serde::Serialize;
@@ -257,14 +257,13 @@ impl FlightSqlService for FlightSqlServiceImpl {
         }
     }
 
-    // 3
     async fn do_action_create_prepared_statement(
         &self,
         query: ActionCreatePreparedStatementRequest,
         _request: Request<Action>,
     ) -> std::result::Result<ActionCreatePreparedStatementResult, Status> {
         let user_query = query.query.as_str();
-        info!("do_action_create_prepared_statement: {user_query}");
+        debug!("do_action_create_prepared_statement: {user_query}");
 
         let plan_uuid = Uuid::new_v4().hyphenated().to_string();
 
@@ -308,7 +307,6 @@ impl FlightSqlService for FlightSqlServiceImpl {
                     .map_err(|e| Status::internal(format!("Error building plan: {e}")))?;
 
                 // store a copy of the plan, it will be used for execution
-
                 self.plans.insert(plan_uuid.clone(), Some(plan.clone()));
                 let plan_schema = plan.schema();
                 let arrow_schema = (&**plan_schema).into();
@@ -327,13 +325,12 @@ impl FlightSqlService for FlightSqlServiceImpl {
         }
     }
 
-    // 4
     async fn get_flight_info_prepared_statement(
         &self,
         query: CommandPreparedStatementQuery,
         _request: Request<FlightDescriptor>,
     ) -> std::result::Result<Response<FlightInfo>, Status> {
-        info!("get_flight_info_prepared_statement");
+        debug!("get_flight_info_prepared_statement");
         let handle = std::str::from_utf8(&query.prepared_statement_handle)
             .map_err(|e| status!("Unable to parse uuid", e))?;
 
@@ -386,7 +383,7 @@ impl FlightSqlService for FlightSqlServiceImpl {
     ) -> Result<(), Status> {
         let handle = std::str::from_utf8(&handle.prepared_statement_handle);
         if let Ok(handle) = handle {
-            info!("do_action_close_prepared_statement: removing plan and results for {handle}");
+            debug!("do_action_close_prepared_statement: removing plan and results for {handle}");
             let _ = self.remove_plan(handle);
             let _ = self.remove_result(handle);
         }
