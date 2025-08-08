@@ -1,0 +1,54 @@
+version: "3.8"
+services:
+  liquid-cache-server:
+    image: liquid_cache_server:latest
+    ports:
+      - "15214:15214"
+      - "53703:53703"
+    volumes:
+      - shared-data:/tmp/data/
+    environment:
+      RUST_LOG: "info"
+      RUST_BACKTRACE: "1"
+    networks:
+      - default
+    command: [
+      "/app/bench_server",
+      "--disk-cache-dir",
+      "/tmp/cache",
+      "--address", 
+      "0.0.0.0:15214", 
+      "--admin-address",
+      "0.0.0.0:53703"
+    ]      
+  flight-server:
+    image: liquid-cache-flight-server:latest
+    ports:
+      - "15215:15215"
+    volumes:
+      - shared-data:/tmp/data/  
+    command: [
+      "/app/flight_sql_server",
+      "--flight-server", 
+      "0.0.0.0:15215", 
+      "--cache-server", 
+      "http://liquid-cache-server:15214", 
+      "--object-store-url", 
+      "file:///data"
+    ]
+    depends_on:
+      - liquid-cache-server
+    networks:
+      - default
+
+networks:
+  default:
+    driver: bridge
+
+volumes:
+  shared-data:
+    driver: local
+    driver_opts:
+      type: none
+      device: /tmp/data
+      o: bind

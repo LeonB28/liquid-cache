@@ -45,10 +45,8 @@
 				"RUST_LOG": "info"
 			},
 			"args": [
-				"--query-path",
-				"benchmark/clickbench/queries/queries.sql",
-				"--file",
-				"benchmark/clickbench/data/hits_0.parquet",
+				"--manifest",
+				"benchmark/clickbench/manifest.json",
 				"--query",
 				"24"
 			],
