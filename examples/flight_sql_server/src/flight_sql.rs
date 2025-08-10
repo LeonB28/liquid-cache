@@ -75,7 +75,7 @@ pub struct FlightServerArgs {
 }
 
 /// FlightSqlService with Liquid cache so support adbc flight sql
-/// Used with examples from: https://github.com/apache/arrow-rs/blob/master/arrow-flight/examples/flight_sql_server.rs
+/// Used with examples from: <https://github.com/apache/arrow-rs/blob/master/arrow-flight/examples/flight_sql_server.rs>
 static INSTANCE_SQL_DATA: Lazy<SqlInfoData> = Lazy::new(|| {
     let mut builder = SqlInfoDataBuilder::new();
     // Server information
