@@ -6,9 +6,9 @@ services:
       - "15214:15214"
       - "53703:53703"
     volumes:
-      - shared-data:/tmp/data/
+      - shared-data:${DATA_PATH:-/tmp/data}
     environment:
-      RUST_LOG: "info"
+      RUST_LOG: "debug"
       RUST_BACKTRACE: "1"
     networks:
       - default
@@ -26,7 +26,7 @@ services:
     ports:
       - "15215:15215"
     volumes:
-      - shared-data:/tmp/data/  
+      - shared-data:${DATA_PATH:-/tmp/data}
     command: [
       "/app/flight_sql_server",
       "--flight-server", 
@@ -50,5 +50,5 @@ volumes:
     driver: local
     driver_opts:
       type: none
-      device: /tmp/data
+      device: ${DATA_PATH:-/tmp/data}
       o: bind

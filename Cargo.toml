@@ -19,7 +19,7 @@ members = [
 	"src/local",
 	"examples",
 	"fuzz",
-	"flight_sql_server"
+    "examples/flight_sql_server"
 ]
 resolver = "3"
 
