@@ -24,7 +24,7 @@ Replace `/path/to/your/data` with the absolute path to the directory containing 
 
     From the `flight_sql_server` directory, run:
     ```bash
-    docker-compose up --build
+    docker-compose up -d
     ```
 
     This will build the Docker image and start the Flight SQL server, which will listen on `localhost:15215`.

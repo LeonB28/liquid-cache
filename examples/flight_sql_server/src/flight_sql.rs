@@ -110,8 +110,8 @@ pub struct FlightSqlServiceImpl {
 }
 
 impl FlightSqlServiceImpl {
-    fn new(cache_server: impl AsRef<str>, object_store_url: String) -> Self {
-        let url = Url::parse(&object_store_url).unwrap();
+    fn new(cache_server: impl AsRef<str>, object_store_url: impl AsRef<str>) -> Self {
+        let url = Url::parse(object_store_url.as_ref()).unwrap();
         let object_store = format!("{}://{}", url.scheme(), url.host_str().unwrap_or_default());
         let ctx = LiquidCacheBuilder::new(cache_server)
             .with_object_store(ObjectStoreUrl::parse(object_store.as_str()).unwrap(), None)
@@ -229,7 +229,7 @@ impl FlightSqlService for FlightSqlServiceImpl {
                 .ok_or_else(|| Status::internal("Expected FetchResults but got None!"))?;
 
             let handle = fr.handle;
-            info!("getting results for {handle}");
+            debug!("getting results for {handle}");
             let result = self.get_result(&handle)?;
 
             // if we get an empty result, create an empty schema
@@ -277,7 +277,8 @@ impl FlightSqlService for FlightSqlServiceImpl {
         match statement {
             Statement::CreateExternalTable(table) => {
                 let location_url =
-                    Url::parse(&table.location).map_err(|e| status!("Unable parse location", e))?;
+                    Url::parse(&table.location)
+                        .map_err(|e| status!("Unable parse location", e))?;
 
                 self.with_table(location_url, &table.name.to_string())
                     .await
