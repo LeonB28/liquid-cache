@@ -11,6 +11,6 @@ ENV PORT2=15216
 
 WORKDIR /app
 
-COPY /target/x86_64-unknown-linux-musl/release/flight_sql_server /app/flight_sql_server
+COPY /target/release/flight_sql_server /app/flight_sql_server
 
 EXPOSE 15215 15216
