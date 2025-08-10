@@ -1,1 +1,0 @@
-# Running Liquid Cache as Flight SQL Server to Support [ADBC](https://arrow.apache.org/adbc/current/)
