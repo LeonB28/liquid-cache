@@ -277,8 +277,7 @@ impl FlightSqlService for FlightSqlServiceImpl {
         match statement {
             Statement::CreateExternalTable(table) => {
                 let location_url =
-                    Url::parse(&table.location)
-                        .map_err(|e| status!("Unable parse location", e))?;
+                    Url::parse(&table.location).map_err(|e| status!("Unable parse location", e))?;
 
                 self.with_table(location_url, &table.name.to_string())
                     .await
