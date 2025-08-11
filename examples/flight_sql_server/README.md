@@ -56,21 +56,21 @@ import polars as pl
 # The URI for the Flight SQL server.
 # Use port 15215 for Docker, and 50051 for a native build.
 uri = "grpc://localhost:15215"
+DATA_PATH = "/path/to/your/data"
 print(f"Connecting to {uri}...")
 
 try:
     with flight_sql.connect(uri) as conn:
         with conn.cursor() as cur:
-
-            # Add file to liquid-cache. The path '/data/hits.parquet' corresponds to the volume mount in the container.
+            # Add file to liquid-cache.
             create_table_query = f"""
                 CREATE EXTERNAL TABLE hits
                 STORED AS PARQUET
-                LOCATION 'file:///data/hits.parquet';
+                LOCATION 'file://{DATA_PATH}';
             """
             cur.execute(create_table_query)
-            
-            # Run query 
+
+            # Run query
             query = """
                 SELECT 
                     "SearchPhrase", 
@@ -99,7 +99,6 @@ try:
 
 except Exception as e:
     print(f"An error occurred: {e}")
-
 ```
 
 ### Running the Client
