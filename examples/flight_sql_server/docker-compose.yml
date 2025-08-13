@@ -1,14 +1,14 @@
 version: "3.8"
 services:
   liquid-cache-server:
-    image: liquid_cache_server:latest
+    image: ghcr.io/xiangpenghao/liquid-cache/liquid-cache-server:latest
     ports:
       - "15214:15214"
       - "53703:53703"
     volumes:
       - shared-data:${DATA_PATH:-/tmp/data}
     environment:
-      RUST_LOG: "debug"
+      RUST_LOG: "info"
       RUST_BACKTRACE: "1"
     networks:
       - default
@@ -22,7 +22,7 @@ services:
       "0.0.0.0:53703"
     ]      
   flight-server:
-    image: liquid-cache-flight-server:latest
+    image: ghcr.io/leonb28/liquid-cache-flight-server:latest
     ports:
       - "15215:15215"
     volumes:
