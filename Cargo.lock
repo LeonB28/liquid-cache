@@ -2777,7 +2777,7 @@ dependencies = [
 
 [[package]]
 name = "liquid-cache-client"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -2798,7 +2798,7 @@ dependencies = [
 
 [[package]]
 name = "liquid-cache-common"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -2818,7 +2818,7 @@ dependencies = [
 
 [[package]]
 name = "liquid-cache-fuzz"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "arbitrary",
  "arrow",
@@ -2829,7 +2829,7 @@ dependencies = [
 
 [[package]]
 name = "liquid-cache-local"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -2844,7 +2844,7 @@ dependencies = [
 
 [[package]]
 name = "liquid-cache-parquet"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "ahash",
  "arrow",
@@ -2868,7 +2868,7 @@ dependencies = [
 
 [[package]]
 name = "liquid-cache-server"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "anyhow",
  "arrow",
@@ -2899,7 +2899,7 @@ dependencies = [
 
 [[package]]
 name = "liquid-cache-storage"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "ahash",
  "arrow",
