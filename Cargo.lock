@@ -2914,6 +2914,8 @@ dependencies = [
  "fastlanes",
  "fsst-rs",
  "futures",
+ "io-uring",
+ "libc",
  "liquid-cache-common",
  "log",
  "mimalloc",
