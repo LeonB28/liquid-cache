@@ -2,6 +2,7 @@ version: "3.8"
 services:
   liquid-cache-server:
     image: ghcr.io/xiangpenghao/liquid-cache/liquid-cache-server:latest
+    platform: linux/amd64
     ports:
       - "15214:15214"
       - "53703:53703"
@@ -23,6 +24,7 @@ services:
     ]      
   flight-server:
     image: ghcr.io/leonb28/liquid-cache-flight-server:latest
+    platform: linux/amd64
     ports:
       - "15215:15215"
     volumes:
