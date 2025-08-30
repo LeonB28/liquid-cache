@@ -533,6 +533,7 @@ impl CacheStorage {
         }
     }
 
+    #[allow(unused)]
     async fn apply_advice_inner(&self, advice: CacheAdvice) {
         match advice {
             CacheAdvice::Transcode(to_transcode) => {
