@@ -41,7 +41,6 @@ use datafusion::sql::parser::{DFParser, Statement};
 use datafusion::{error::Result, execution::object_store::ObjectStoreUrl};
 use futures::{StreamExt, TryStreamExt};
 use liquid_cache_client::LiquidCacheBuilder;
-use liquid_cache_common::CacheMode;
 use log::{debug, info};
 use once_cell::sync::Lazy;
 use prost::Message;
@@ -115,7 +114,6 @@ impl FlightSqlServiceImpl {
         let object_store = format!("{}://{}", url.scheme(), url.host_str().unwrap_or_default());
         let ctx = LiquidCacheBuilder::new(cache_server)
             .with_object_store(ObjectStoreUrl::parse(object_store.as_str()).unwrap(), None)
-            .with_cache_mode(CacheMode::Liquid)
             .build(SessionConfig::from_env().unwrap())
             .unwrap();
 
