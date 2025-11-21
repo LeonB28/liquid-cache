@@ -16,7 +16,7 @@ liquid-cache-common = { workspace = true }
 
 
 datafusion = { workspace = true }
-tonic = { workspace = true, features = ["transport", "tls"] }
+tonic = { workspace = true }
 log = { workspace = true }
 futures = { workspace = true }
 prost = { workspace = true }

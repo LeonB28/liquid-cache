@@ -307,7 +307,7 @@ impl FlightSqlService for FlightSqlServiceImpl {
                 // store a copy of the plan, it will be used for execution
                 self.plans.insert(plan_uuid.clone(), Some(plan.clone()));
                 let plan_schema = plan.schema();
-                let arrow_schema = (&**plan_schema).into();
+                let arrow_schema: Schema = plan_schema.clone().as_arrow().clone();
                 let message = SchemaAsIpc::new(&arrow_schema, &IpcWriteOptions::default())
                     .try_into()
                     .map_err(|e| status!("Unable to serialize schema", e))?;
